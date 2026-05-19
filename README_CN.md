@@ -58,6 +58,10 @@ preparing snow_search…
 
 结果跟在同一条回复里返回，不需要额外操作。
 
+> **提示：** snow_search 够快（<0.5ms），AI 可能会本能地用 session_search、sqlite3 等慢工具补查。
+> 建议在角色定义文件（如 `SOUL.md`、`MEMORY.md` 或 `config.yaml` 的 `agent.personalities`）中添加规则：
+> _snow_search 结果就是最终结果，信它，不补查。_
+
 ## 安装
 
 ```bash

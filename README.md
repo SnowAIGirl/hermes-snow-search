@@ -59,6 +59,11 @@ preparing snow_search…
 
 That's it — results come back in the same response.
 
+> **Tip:** snow_search is fast enough (<0.5ms) that your AI may instinctively
+> double-check results with slower tools (session_search, sqlite3). To prevent this,
+> add a rule to your agent's behavioral config (e.g. `SOUL.md`, `MEMORY.md`, or `agent.personalities` in `config.yaml`):
+> _snow_search results are final — trust them, don't re-query._
+
 ## Installation
 
 ```bash

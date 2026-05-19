@@ -19,3 +19,6 @@ venv/
 
 # macOS
 .DS_Store
+
+# Dev scripts
+_*.py
