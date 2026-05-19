@@ -488,10 +488,19 @@ class SnowSearchEngine:
             args = {}
 
         try:
-            if tool_name == "fact_store" and args.get("action") == "add":
-                self._on_fact_added(args, result)
-            elif tool_name == "memory" and args.get("action") == "add":
-                self._on_memory_added(args)
+            action = args.get("action", "")
+            if tool_name == "fact_store":
+                if action == "add":
+                    self._on_fact_added(args, result)
+                elif action == "remove":
+                    self._on_fact_removed(args)
+                elif action in ("replace", "update"):
+                    self._on_fact_updated(args)
+            elif tool_name == "memory":
+                if action == "add":
+                    self._on_memory_added(args)
+                elif action in ("replace", "remove"):
+                    self._on_memory_removed_or_replaced(args)
         except Exception:
             pass  # Never let a hook crash the agent loop
 
@@ -532,6 +541,74 @@ class SnowSearchEngine:
         with self._lock:
             self._memory_entries.insert(0, entry)
             self._current_bytes += _estimate_bytes(entry)
+
+    # -- fact remove / update -------------------------------------------------
+
+    def _on_fact_removed(self, args: dict) -> None:
+        """Remove fact from in-memory cache by fact_id."""
+        fact_id = args.get("fact_id")
+        if fact_id is None:
+            return
+        with self._lock:
+            before = len(self._facts)
+            self._facts = [f for f in self._facts if f.get("fact_id") != fact_id]
+            removed = before - len(self._facts)
+            if removed:
+                self._current_bytes = (
+                    _estimate_bytes(self._sessions)
+                    + _estimate_bytes(self._facts)
+                    + _estimate_bytes(self._memory_entries)
+                )
+
+    def _on_fact_updated(self, args: dict) -> None:
+        """Update fact content in in-memory cache."""
+        fact_id = args.get("fact_id")
+        content = args.get("content", "")
+        if fact_id is None or not content:
+            return
+        with self._lock:
+            for f in self._facts:
+                if f.get("fact_id") == fact_id:
+                    old_bytes = _estimate_bytes(f)
+                    f["content"] = content
+                    f["category"] = args.get("category", f.get("category", "general"))
+                    f["tags"] = args.get("tags", f.get("tags", ""))
+                    self._current_bytes += _estimate_bytes(f) - old_bytes
+                    break
+
+    # -- memory remove / replace ----------------------------------------------
+
+    def _on_memory_removed_or_replaced(self, args: dict) -> None:
+        """Remove or replace a memory entry by target+old_text match."""
+        target = args.get("target", "memory")
+        old_text = args.get("old_text", "")
+        source = "MEMORY.md" if target == "memory" else "USER.md"
+        action = args.get("action", "")
+
+        if not old_text:
+            return
+
+        with self._lock:
+            before = len(self._memory_entries)
+            # Filter out the old entry
+            self._memory_entries = [
+                m for m in self._memory_entries
+                if not (m.get("source") == source and old_text in m.get("content", ""))
+            ]
+            if action == "replace":
+                # Add the new content
+                new_content = args.get("content", "")
+                if new_content:
+                    self._memory_entries.insert(0, {
+                        "source": source,
+                        "content": new_content,
+                    })
+            if before != len(self._memory_entries):
+                self._current_bytes = (
+                    _estimate_bytes(self._sessions)
+                    + _estimate_bytes(self._facts)
+                    + _estimate_bytes(self._memory_entries)
+                )
 
     def on_pre_llm_call(self, **kwargs) -> dict | str | None:
         """Eviction check before each LLM call."""
