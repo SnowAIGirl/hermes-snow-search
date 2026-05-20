@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,10 +38,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-_DEFAULT_LIMIT_MB = 20
+_DEFAULT_LIMIT_MB = 500
 _DEFAULT_SESSION_MAX = 7000
 _DEFAULT_FACT_MAX = 10000
 _DEFAULT_MEMORY_MAX = 100
+
+# Deep search
+_DEFAULT_DEEP_ENABLED = True
+_DEFAULT_DEEP_LOAD_MODE = "ondemand"  # "startup" | "ondemand"
 
 # ---------------------------------------------------------------------------
 # Tool schema
@@ -87,6 +92,17 @@ SNOW_SEARCH_SCHEMA = {
                 "description": "Include built-in memory entries in search (default: true).",
                 "default": True,
             },
+            "deep": {
+                "type": "boolean",
+                "description": "Search full message bodies instead of session summaries. Requires deep search index (loaded on first use). Default: false.",
+                "default": False,
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["relevance", "oldest", "newest"],
+                "description": "Sort order: 'relevance' (default, best match first), 'oldest' (earliest timestamp first — use when user asks about FIRST / EARLIEST occurrence), 'newest' (latest timestamp first — use when user asks about LAST / MOST RECENT).",
+                "default": "relevance",
+            },
         },
         "required": ["query"],
     },
@@ -122,6 +138,12 @@ def _estimate_bytes(obj: Any) -> int:
         return 0
 
 
+def _emit(msg: str) -> None:
+    """Write progress to stderr — visible in terminal, not captured by tool output."""
+    sys.stderr.write(f"[Hermes Snow Search] {msg}\n")
+    sys.stderr.flush()
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -141,6 +163,10 @@ class SnowSearchEngine:
         self._fact_max = config.get("fact_max", _DEFAULT_FACT_MAX)
         self._memory_max = config.get("memory_max", _DEFAULT_MEMORY_MAX)
 
+        # --- deep search config ---
+        self._deep_enabled = config.get("deep_search_enabled", _DEFAULT_DEEP_ENABLED)
+        self._deep_mode = config.get("deep_search_load_mode", _DEFAULT_DEEP_LOAD_MODE)
+
         # --- data (lazy loaded) ---
         self._ready = False
         self._load_error: str | None = None
@@ -150,6 +176,15 @@ class SnowSearchEngine:
         self._memory_entries: list[dict] = []  # source (MEMORY.md/USER.md), content
 
         self._current_bytes = 0
+
+        # --- deep search data ---
+        self._deep_ready = False
+        self._deep_messages: list[dict] = []  # message_id, session_id, timestamp, role, content
+        self._deep_bytes = 0
+        self._deep_total_sessions = 0
+        self._deep_earliest_ts = 0.0
+        self._deep_latest_ts = 0.0
+        self._deep_max_message_id = 0  # highest message id loaded
 
         # --- holographic availability (checked once) ---
         self._holographic_available: bool | None = None
@@ -194,6 +229,21 @@ class SnowSearchEngine:
                 self._load_error = str(e)
                 logger.warning("snow-search initial load failed: %s", e)
 
+    def _ensure_facts_and_memory(self) -> None:
+        """Load only facts and memory (no sessions). Used by deep search path."""
+        if self._facts and self._memory_entries:
+            return
+        with self._lock:
+            if self._facts and self._memory_entries:
+                return
+            try:
+                memory = self._load_memory()
+                facts = self._load_facts()
+                self._memory_entries = memory
+                self._facts = facts
+            except Exception as e:
+                logger.warning("snow-search partial load failed: %s", e)
+
     def _load_all(self) -> None:
         """Load all three stores into RAM — silent, no terminal output."""
         total = 0
@@ -210,6 +260,219 @@ class SnowSearchEngine:
         total += _estimate_bytes(facts)
         self._facts = facts
         self._current_bytes = total
+
+    def _ensure_deep_loaded(self) -> None:
+        """Load full message bodies on first deep search. Thread-safe."""
+        if self._deep_ready:
+            return
+        with self._lock:
+            if self._deep_ready:
+                return
+            try:
+                self._load_deep()
+                self._deep_ready = True
+            except Exception as e:
+                logger.warning("snow-search deep load failed: %s", e)
+                raise
+
+    def _refresh_deep_if_needed(self) -> None:
+        """Check for new messages since last load and incrementally update.
+
+        Runs before every deep search. Queries MAX(id) from messages table
+        (~0.1ms), only fetches new rows if max_id changed.
+        Thread-safe via _deep_ready being True — called only after
+        _ensure_deep_loaded() has completed.
+        """
+        if not self._deep_messages:
+            return
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            try:
+                row = db._conn.execute(
+                    "SELECT MAX(id) FROM messages "
+                    "WHERE role IN ('user','assistant') AND content IS NOT NULL"
+                ).fetchone()
+                if not row or row[0] is None:
+                    return
+                current_max = row[0]
+                if current_max <= self._deep_max_message_id:
+                    return
+
+                # Fetch new messages since last load
+                new_rows = db._conn.execute(
+                    "SELECT id, session_id, role, content, timestamp "
+                    "FROM messages WHERE id > ? "
+                    "AND role IN ('user','assistant') AND content IS NOT NULL",
+                    (self._deep_max_message_id,),
+                ).fetchall()
+
+                added = 0
+                for r in new_rows:
+                    entry = {
+                        "message_id": r[0],
+                        "session_id": r[1],
+                        "role": r[2],
+                        "content": r[3],
+                        "timestamp": r[4],
+                        "content_preview": r[3][:200],
+                    }
+                    self._deep_messages.append(entry)
+                    self._deep_bytes += _estimate_bytes(entry)
+                    ts = r[4]
+                    if ts < self._deep_earliest_ts:
+                        self._deep_earliest_ts = ts
+                    if ts > self._deep_latest_ts:
+                        self._deep_latest_ts = ts
+                    added += 1
+                    if r[0] > self._deep_max_message_id:
+                        self._deep_max_message_id = r[0]
+
+                if added > 0:
+                    # Re-sort by timestamp descending
+                    self._deep_messages.sort(key=lambda m: -m["timestamp"])
+                    self._deep_total_sessions = len(
+                        set(m["session_id"] for m in self._deep_messages)
+                    )
+                    logger.debug(
+                        "snow-search deep refresh: +%d messages, now %d total, ~%d MB",
+                        added, len(self._deep_messages),
+                        self._deep_bytes // (1024 * 1024),
+                    )
+            finally:
+                db.close()
+        except Exception as e:
+            logger.debug("snow-search deep refresh failed: %s", e)
+
+    def _load_deep(self) -> None:
+        """Load full message bodies from SessionDB into RAM.
+
+        Iterates sessions newest-first, pulls all messages per session,
+        stores user/assistant messages with session_id and timestamp.
+        Stops at 85% of memory_limit.
+        Prints progress to terminal.
+        """
+        from hermes_state import SessionDB
+        db = SessionDB()
+
+        raw = db.list_sessions_rich(
+            limit=100000,
+            exclude_sources=["tool"],
+            order_by_last_active=True,
+        )
+
+        sessions = [s for s in raw if not s.get("parent_session_id")]
+        total = len(sessions)
+        cap = int(self._memory_limit * 0.85)
+        start_time = time.time()
+        last_print_pct = -1
+
+        self._deep_messages = []
+        self._deep_bytes = 0
+        self._deep_total_sessions = 0
+        self._deep_earliest_ts = float("inf")
+        self._deep_latest_ts = 0.0
+
+        _emit("Loading deep search index...")
+
+        for i, s in enumerate(sessions):
+            sid = s.get("id", "")
+            if not sid:
+                continue
+
+            try:
+                msgs = db.get_messages(sid)
+            except Exception:
+                continue
+
+            for m in msgs:
+                role = m.get("role", "")
+                if role not in ("user", "assistant"):
+                    continue
+                content = m.get("content", "")
+                if not content:
+                    continue
+
+                entry = {
+                    "message_id": m["id"],
+                    "session_id": sid,
+                    "timestamp": m["timestamp"],
+                    "role": role,
+                    "content": content,
+                    "content_preview": content[:200],
+                }
+                self._deep_messages.append(entry)
+                self._deep_bytes += _estimate_bytes(entry)
+                ts = m["timestamp"]
+                if ts < self._deep_earliest_ts:
+                    self._deep_earliest_ts = ts
+                if ts > self._deep_latest_ts:
+                    self._deep_latest_ts = ts
+
+            self._deep_total_sessions += 1
+
+            # Progress printing at milestones
+            pct = (i + 1) / total * 100
+            milestone = min(int(pct / 25) * 25, 100) if pct >= 5 else 0
+            if milestone != last_print_pct and pct >= milestone:
+                last_print_pct = milestone
+                elapsed = time.time() - start_time
+                msg_count = len(self._deep_messages)
+                mb_used = self._deep_bytes // (1024 * 1024)
+                avg_per_session = elapsed / (i + 1)
+                remaining_s = (total - i - 1) * avg_per_session if i > 0 else 0
+                if remaining_s >= 1:
+                    remaining_str = f" | ~{remaining_s:.0f}s remaining"
+                elif remaining_s > 0:
+                    remaining_str = f" | ~{int(remaining_s * 1000)}ms remaining"
+                else:
+                    remaining_str = ""
+                _emit(
+                    f"Session {i + 1}/{total} | {msg_count} messages | "
+                    f"{mb_used}/{self._memory_limit // (1024 * 1024)} MB{remaining_str}"
+                )
+
+            # Memory cap check
+            if self._deep_bytes >= cap:
+                break
+
+        db.close()
+
+        # Sort by timestamp descending
+        self._deep_messages.sort(key=lambda m: -m["timestamp"])
+
+        # Track highest message id for incremental refresh
+        if self._deep_messages:
+            self._deep_max_message_id = max(m["message_id"] for m in self._deep_messages)
+        else:
+            self._deep_max_message_id = 0
+
+        # Final report
+        msg_count = len(self._deep_messages)
+        mb_used = self._deep_bytes // (1024 * 1024)
+        if self._deep_earliest_ts < float("inf"):
+            import datetime
+            earliest = datetime.datetime.fromtimestamp(self._deep_earliest_ts).strftime("%b %d")
+            latest = datetime.datetime.fromtimestamp(self._deep_latest_ts).strftime("%b %d")
+            days = (self._deep_latest_ts - self._deep_earliest_ts) / 86400
+            if days >= 1:
+                coverage = f" | {days:.0f} days ({earliest} ~ {latest})"
+            else:
+                coverage = ""
+        else:
+            coverage = ""
+
+        _emit(
+            f"Deep search ready | "
+            f"{msg_count} messages{coverage} | {mb_used} MB"
+        )
+
+        # Full coverage indicator
+        if self._deep_total_sessions >= total:
+            _emit(f"All chat data loaded -- full coverage, no eviction")
+        else:
+            pct_loaded = self._deep_total_sessions / total * 100 if total > 0 else 0
+            _emit(f"Memory cap reached -- {self._deep_total_sessions}/{total} sessions loaded ({pct_loaded:.0f}%), oldest evicted")
 
     def _load_sessions(self) -> list[dict]:
         """Load session titles + previews from SessionDB."""
@@ -337,13 +600,21 @@ class SnowSearchEngine:
         **kwargs,
     ) -> str:
         """Tool handler: parallel search across all loaded stores."""
-        self._ensure_loaded()
-
         query = args.get("query", "")
         limit = min(int(args.get("limit_per_source", 5)), 20)
         include_sessions = args.get("include_sessions", True)
         include_facts = args.get("include_facts", True)
         include_memory = args.get("include_memory", True)
+        deep = args.get("deep", False)
+
+        if deep:
+            # Deep mode: load full message bodies + facts + memory (skip sessions)
+            self._ensure_facts_and_memory()
+            self._ensure_deep_loaded()
+            self._refresh_deep_if_needed()
+        else:
+            # Light mode: load all lightweight stores
+            self._ensure_loaded()
 
         if not query or not query.strip():
             return json.dumps({
@@ -355,6 +626,7 @@ class SnowSearchEngine:
                     "sessions": bool(self._sessions),
                     "facts": bool(self._facts),
                     "memory": bool(self._memory_entries),
+                    "deep_messages": bool(self._deep_messages),
                 },
                 "message": "No query provided. Use query= to search across all stores.",
             })
@@ -365,8 +637,23 @@ class SnowSearchEngine:
 
         # Determine which stores to search
         stores = {}
-        if include_sessions and self._sessions:
-            stores["sessions"] = self._sessions
+
+        if deep:
+            if not self._deep_enabled:
+                # Deep search not configured — fall back to session search
+                if include_sessions and self._sessions:
+                    stores["sessions"] = self._sessions
+            else:
+                # Deep mode: ensure loaded + refresh, then search message bodies
+                self._ensure_deep_loaded()
+                self._refresh_deep_if_needed()
+                if include_sessions and self._deep_messages:
+                    stores["deep_messages"] = self._deep_messages
+        else:
+            # Light mode: search session summaries
+            if include_sessions and self._sessions:
+                stores["sessions"] = self._sessions
+
         if include_facts and self._facts:
             stores["facts"] = self._facts
         if include_memory and self._memory_entries:
@@ -382,11 +669,16 @@ class SnowSearchEngine:
             })
 
         # Parallel search
+        # Determine sort mode — affects how many hits we pull per searcher
+        sort = args.get("sort", "relevance")
+        # Chronological sort needs more raw data to avoid score-based pre-cutting
+        searcher_limit = limit * 10 if sort in ("oldest", "newest") else limit
+
         hits = []
         with ThreadPoolExecutor(max_workers=len(stores)) as ex:
             future_map = {}
             for store_name, data in stores.items():
-                fn = self._make_searcher(store_name, data, query_tokens, limit)
+                fn = self._make_searcher(store_name, data, query_tokens, searcher_limit)
                 future_map[ex.submit(fn)] = store_name
             for f in as_completed(future_map):
                 store_name = future_map[f]
@@ -396,11 +688,31 @@ class SnowSearchEngine:
                 except Exception as e:
                     logger.debug("snow-search %s failed: %s", store_name, e)
 
-        # Sort by score desc, then source priority
-        hits.sort(key=lambda h: (-h.get("score", 0), h.get("source", "")))
-        total = len(hits)
-        # Trim to reasonable total
-        hits = hits[:limit * 3]
+        if sort == "oldest":
+            # Chronological ascending — keep all hits, sort by time, trim at end
+            hits.sort(key=lambda h: h.get("timestamp", float("inf")) if h.get("timestamp") else float("inf"))
+            total = len(hits)
+            hits = hits[:limit * 3]
+        elif sort == "newest":
+            # Chronological descending — keep all hits, sort by time desc, trim at end
+            hits.sort(key=lambda h: -(h.get("timestamp", 0) if h.get("timestamp") else 0))
+            total = len(hits)
+            hits = hits[:limit * 3]
+        else:
+            # Default: sort by score desc, then trim
+            hits.sort(key=lambda h: (-h.get("score", 0), h.get("source", "")))
+            total = len(hits)
+            hits = hits[:limit * 3]
+
+        # Search coverage metadata
+        search_info = {
+            "sessions_scanned": len(self._sessions) if not deep and self._sessions else self._deep_total_sessions if deep and self._deep_messages else 0,
+        }
+        if deep and self._deep_messages:
+            search_info["messages_scanned"] = len(self._deep_messages)
+            if self._deep_earliest_ts < float("inf") and self._deep_latest_ts > 0:
+                import datetime
+                search_info["date_range"] = f"{datetime.datetime.fromtimestamp(self._deep_earliest_ts).strftime('%b %d')} ~ {datetime.datetime.fromtimestamp(self._deep_latest_ts).strftime('%b %d')}"
 
         return json.dumps({
             "success": True,
@@ -411,7 +723,9 @@ class SnowSearchEngine:
                 "sessions": bool(self._sessions),
                 "facts": bool(self._facts),
                 "memory": bool(self._memory_entries),
+                "deep_messages": bool(self._deep_messages),
             },
+            "search_info": search_info,
         }, ensure_ascii=False)
 
     def _make_searcher(self, store_name: str, data: list[dict], tokens: set[str], limit: int):
@@ -430,6 +744,10 @@ class SnowSearchEngine:
                         entry["session_id"] = item.get("session_id", "")
                         entry["title"] = item.get("title", "Untitled")
                         entry["last_active"] = item.get("last_active", "")
+                    elif store_name == "deep_messages":
+                        entry["session_id"] = item.get("session_id", "")
+                        entry["timestamp"] = item.get("timestamp", 0)
+                        entry["role"] = item.get("role", "")
                     scored.append(entry)
 
             scored.sort(key=lambda x: -x["score"])
@@ -459,6 +777,20 @@ class SnowSearchEngine:
             content = item.get("content", "")
             return _match_score(tokens, content) * 2.0
 
+        elif store == "deep_messages":
+            content = item.get("content", "")
+            preview = item.get("content_preview", "")
+            score = _match_score(tokens, content) * 2.0
+            score += _match_score(tokens, preview) * 1.0
+            # Recency boost: messages within last 24h get +0.5
+            import time as _time
+            age = _time.time() - item.get("timestamp", 0)
+            if age < 86400:
+                score += 0.5
+            elif age < 604800:
+                score += 0.2
+            return score
+
         return 0.0
 
     @staticmethod
@@ -470,6 +802,8 @@ class SnowSearchEngine:
             return item.get("content", "")
         elif store == "memory":
             return item.get("content", "")
+        elif store == "deep_messages":
+            return item.get("content_preview", item.get("content", ""))
         return ""
 
     # -- incremental updates via hooks ----------------------------------------
@@ -652,13 +986,16 @@ class SnowSearchEngine:
         """Force a full reload of all stores. Usable from /snow-reload command."""
         with self._lock:
             self._ready = False
+            self._deep_ready = False
             self._holographic_available = None
         self._ensure_loaded()
+        msg = f"snow-search reloaded: {len(self._sessions)} sessions, {len(self._facts)} facts, {len(self._memory_entries)} memory, ~{self._current_bytes // (1024 * 1024)} MB"
+        if self._deep_enabled:
+            try:
+                self._ensure_deep_loaded()
+                msg += f" | deep: {len(self._deep_messages)} messages, ~{self._deep_bytes // (1024 * 1024)} MB"
+            except Exception as e:
+                msg += f" | deep: error ({e})"
         if self._load_error:
             return f"snow-search reloaded with error: {self._load_error}"
-        return (
-            f"snow-search reloaded: "
-            f"{len(self._sessions)} sessions, {len(self._facts)} facts, "
-            f"{len(self._memory_entries)} memory entries, "
-            f"~{self._current_bytes // (1024 * 1024)} MB"
-        )
+        return msg

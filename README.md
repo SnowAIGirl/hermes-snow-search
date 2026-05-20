@@ -1,118 +1,103 @@
-# Herme Snow Search
+# Hermes Snow Search
 
 > [![GitHub](https://img.shields.io/badge/GitHub-mlinquan%2Fhermes--snow--search-blue?logo=github)](https://github.com/mlinquan/hermes-snow-search)
 > English | [中文版](README_CN.md)
 
 In-memory parallel search plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
-Loads session history, holographic facts (fact_store), and built-in memory (MEMORY.md / USER.md) into RAM at startup.
-Searches all three stores in parallel — results in <1ms.
+Loads session history, holographic facts (fact_store), and built-in memory (MEMORY.md / USER.md) into RAM.
+Searches all stores in parallel — results in <1ms. Supports full message-body deep search.
 
 ## How it works
 
 1. **Eager load** — data is loaded in a background thread right after Hermes starts
 2. **Keep in RAM** — sessions, facts, and memory entries live in Python lists, no I/O on search
-3. **Parallel search** — `ThreadPoolExecutor` runs the three stores concurrently
+3. **Parallel search** — `ThreadPoolExecutor` runs all stores concurrently
 4. **Incremental updates** — `post_tool_call` hook catches `fact_store add` and `memory add` → appends to cache
 5. **Eviction** — `pre_llm_call` hook checks memory usage; evicts oldest/lowest-trust entries when >80% of limit
-
-> **Memory provider note:** Currently supports Hermes' built-in holographic memory (fact_store). Support for other memory providers (mem0, supermemory, Honcho, etc.) is on the roadmap.
-
-## Performance
-
-| | Before | After |
-|--|--------|-------|
-| Query path | 3 serial DB queries | 1 parallel RAM search |
-| Typical latency | ~350–700ms | **<0.5ms** |
-
-Data lives in RAM from startup. No disk I/O, no serial waits. Just one parallel fetch across all three stores.
-
-## Startup
-
-Silent background load — no terminal output. Data is ready before the first `snow_search` call.
-
-> **Memory note:** Each Hermes instance loads its own copy. CLI and Gateway
-> run as separate processes, so memory usage can reach 2× your configured
-> `memory_limit_mb` (e.g. 40 MB total if set to 20 MB).
-
-On first use, the terminal shows:
-
-```
-preparing snow_search…
-  ┊ ⚡ snow_sear <query>  0.0s
-  ┊ 🔍 recall    "<query>"  0.3s
-```
-
-Key signs of success:
-- `preparing snow_search…` confirms the tool is registered and ready
-- Response comes back instantly (RAM-speed)
-
-## Usage
-
-`snow_search` is an AI-side tool. When you ask Hermes Agent about past conversations —
-"what did we discuss last week" or "I remember we talked about…" — she calls it automatically.
-
-You can also explicitly mention it: `snow_search query="database migration"`
-
-On first use, the terminal shows:
-
-```
-preparing snow_search…
-  ┊ ⚡ snow_sear <query>  0.0s
-  ┊ 🔍 recall    "<query>"  0.3s
-```
-
-That's it — results come back in the same response.
-
-> **Tip:** snow_search is fast enough (<0.5ms) that your AI may instinctively
-> double-check results with slower tools (session_search, sqlite3). To prevent this,
-> add a rule to your agent's behavioral config (e.g. `SOUL.md`, `MEMORY.md`, or `agent.personalities` in `config.yaml`):
-> _snow_search results are final — trust them, don't re-query._
+6. **Deep search** — full message-body index with session_id + timestamp + role. Incremental refresh via `SELECT MAX(id)`
 
 ## Installation
 
 ```bash
-# 1. Install in Hermes venv (editable mode, one-time)
-pip3 install -e ~/works/hermes-snow-search
-
-# 2. Enable the plugin
+pip install hermes-snow-search
 hermes plugins enable hermes-snow-search
-
-# 3. Restart Hermes session (/new or re-launch)
+# Restart Hermes (/new or re-launch)
 ```
 
 ## Configuration
 
 ```yaml
 plugins:
-  enabled:
-    - hermes-bus-plugin
-    - hermes-snow-search
   hermes-snow-search:
-    memory_limit_mb: 20
+    memory_limit_mb: 500          # safety cap, not actual usage
     session_max: 7000
     fact_max: 10000
-    memory_max: 100
+    deep_search_enabled: true     # set false to use lightweight only
+    deep_search_load_mode: "ondemand"   # "ondemand" | "startup"
 ```
 
-| Key | Default | Description | Retention |
-|-----|---------|-------------|-----------|
-| `memory_limit_mb` | 20 | Hard memory cap; triggers eviction at 80% | 6+ months at ~35 sessions/day |
-| `session_max` | 7000 | Max session entries in cache | 6+ months (~200 days) at ~35 sessions/day |
-| `fact_max` | 10000 | Max fact entries in cache | Rarely hit before session eviction |
-| `memory_max` | 100 | Max MEMORY.md/USER.md entries in cache | ~<1 KB, never a bottleneck |
+| Key | Default | Description |
+|-----|---------|-------------|
+| `memory_limit_mb` | 500 | Hard memory cap; eviction triggers at 80% |
+| `session_max` | 7000 | Max session entries in lightweight cache |
+| `fact_max` | 10000 | Max fact entries in cache |
+| `deep_search_enabled` | true | Enables full message-body search. Set `false` for lightweight-only mode |
+| `deep_search_load_mode` | ondemand | `ondemand` = load on first search, `startup` = background at boot |
 
-Both primary limits are balanced for ~6 months of daily usage at ~1 billion tokens/day
-(heavy use, ~35 sessions/day). At ~86 KB/day total growth, `session_max` (7000) and
-`memory_limit_mb` (20 MB) expire around the same time — sessions are the slightly
-tighter bottleneck by design. 6 months of data at this rate totals ~13 MB.
+> `memory_limit_mb` (500 MB) is a safety cap, not actual usage. One week of real conversation (~230 sessions, ~10,000 messages) fits in ~6 MB. At 500 MB you can store roughly **1-2 years** of heavy daily use — memory won't be the bottleneck.
 
-### Recommended tiers for longer retention
+## Deep Search
 
-| Tier | Retention | `session_max` | `memory_limit_mb` | Search speed |
-|------|-----------|---------------|-------------------|--------------|
-| Default | 6 months | 7,000 | 20 | <1ms |
-| 1 year | 1 year | 13,000 | 35 | <1ms |
-| 2 years | 2 years | 26,000 | 70 | ~1ms |
-| Unlimited | Never evict | 50,000 | 150 | ~2ms |
+Enabled by default (`deep_search_enabled: true`). When active, full message-body search replaces lightweight session summaries automatically. Results include `session_id`, `timestamp`, `role`, and `search_info`.
 
-RAM search scales linearly with data — 10x more data ≈ 5x slower, but still under 2ms even for 2+ years. Speed is never the bottleneck; adjust retention to your comfort.
+### Load modes
+
+| Mode | When | Behavior |
+|------|------|----------|
+| `ondemand` (default) | On first deep search | Blocks until index is built, shows progress |
+| `startup` | Background, 2.5s after startup | Non-blocking, prints progress at ~0/50/100% |
+
+Progress is written to stderr:
+
+```
+[Hermes Snow Search] Loading deep search index...
+[Hermes Snow Search] Session 58/231 | 2,500 messages | 10/500 MB | ~0.6s remaining
+[Hermes Snow Search] Deep search ready | 10,229 messages | 7 days (May 13 ~ May 20) | 6 MB
+```
+
+Index builds from newest sessions backwards, stops at 85% of `memory_limit_mb`. Subsequent calls use `SELECT MAX(id)` for incremental refresh — cross-process sync is automatic (shared state.db).
+
+### Sort modes
+
+| `sort` | Behavior |
+|--------|----------|
+| `relevance` (default) | Best match first (recency + keyword score) |
+| `oldest` | Earliest timestamp first — answer "when did X first happen" |
+| `newest` | Latest timestamp first — answer "when was the last X" |
+
+### Performance
+
+| Mode | Searches | Latency | Memory (1 week) |
+|------|----------|---------|-----------------|
+| Lightweight | Session summaries | <0.5ms | ~3 MB |
+| Deep | Full message bodies | ~1-5ms | ~6 MB |
+
+Lightweight and deep mode never load simultaneously — deep mode skips sessions and loads facts + memory + messages.
+
+## Caveats
+
+- **First use delay (ondemand):** First deep search triggers index building (~1s for ~1 week).
+- **Root sessions only:** Deep search indexes user ↔ assistant conversations. Subagent sessions (delegate_task children) are excluded.
+- **Tool messages excluded:** Only `user` and `assistant` role messages are stored.
+
+## Usage Tips
+
+- **"Latest" questions match naturally** — snow_search ranks by relevance with recency boost.
+- **"First time" questions use `sort="oldest"`** — the earliest hit moves to the top.
+- **Specific keywords win** — "database migration schema users" beats "that database thing".
+- **Cross-process auto-sync** — no manual reload needed between CLI and Gateway.
+- **Trust the result** — snow_search sweeps everything in RAM. If it found nothing, there's no record.
+
+## Author
+
+LinQuan & Snow (AI Girl)

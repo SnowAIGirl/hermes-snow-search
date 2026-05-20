@@ -37,6 +37,12 @@ def register(ctx) -> None:
     def _eager_load():
         time.sleep(2.5)  # Wait for CLI startup banner + Bus messages
         _engine._ensure_loaded()
+        # Startup deep search if configured
+        if _engine._deep_enabled and _engine._deep_mode == "startup":
+            try:
+                _engine._ensure_deep_loaded()
+            except Exception:
+                pass
 
     threading.Thread(target=_eager_load, daemon=True).start()
     logger.info("hermes-snow-search registered — eager loading in background")
