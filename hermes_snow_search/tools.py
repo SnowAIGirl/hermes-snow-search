@@ -134,6 +134,14 @@ SNOW_SEARCH_SCHEMA = {
                 "description": "Search full message bodies instead of session summaries. Requires deep search index (loaded on first use). Default: false.",
                 "default": False,
             },
+            "start_timestamp": {
+                "type": "number",
+                "description": "Optional unix timestamp (float). If set, only return results with timestamp >= this value. Works with deep mode (message timestamps) and session mode (last_active).",
+            },
+            "end_timestamp": {
+                "type": "number",
+                "description": "Optional unix timestamp (float). If set, only return results with timestamp < this value. Pairs with start_timestamp for range queries. Can be used alone to filter 'before X'.",
+            },
             "sort": {
                 "type": "string",
                 "enum": ["relevance", "oldest", "newest"],
@@ -762,6 +770,11 @@ class SnowSearchEngine:
         include_soul = args.get("include_soul", True)
         deep = args.get("deep", False)
 
+        # ① Read time filter params
+        start_ts = args.get("start_timestamp")
+        end_ts = args.get("end_timestamp")
+        has_time_filter = start_ts is not None or end_ts is not None
+
         # Action routing
         action = args.get("action", "search")
         if action == "reload":
@@ -778,25 +791,27 @@ class SnowSearchEngine:
             # Light mode: load all lightweight stores
             self._ensure_loaded()
 
+        # ② ⑦ Empty query: if no time filter, return early; with time filter, do full scan
         if not query or not query.strip():
-            return json.dumps({
-                "success": True,
-                "query": "",
-                "hits": [],
-                "total": 0,
-                "stores_available": {
-                    "sessions": bool(self._sessions),
-                    "facts": bool(self._facts),
-                    "memory": bool(self._memory_entries),
-                    "deep_messages": bool(self._deep_messages),
-                    "skills": bool(self._skills),
-                    "soul": bool(self._soul),
-                },
-                "message": "No query provided. Use query= to search across all stores.",
-            })
+            if not has_time_filter:
+                return json.dumps({
+                    "success": True,
+                    "query": "",
+                    "hits": [],
+                    "total": 0,
+                    "stores_available": {
+                        "sessions": bool(self._sessions),
+                        "facts": bool(self._facts),
+                        "memory": bool(self._memory_entries),
+                        "deep_messages": bool(self._deep_messages),
+                        "skills": bool(self._skills),
+                        "soul": bool(self._soul),
+                    },
+                    "message": "No query provided. Use query= to search across all stores.",
+                })
 
-        query_tokens = _tokenize(query)
-        if not query_tokens:
+        query_tokens = _tokenize(query) if query else set()
+        if not query_tokens and not has_time_filter:
             return json.dumps({"success": True, "query": query, "hits": [], "total": 0})
 
         # Determine which stores to search
@@ -812,9 +827,17 @@ class SnowSearchEngine:
                 self._ensure_deep_loaded()
                 self._refresh_deep_if_needed()
                 if include_sessions and self._deep_messages:
-                    stores["deep_messages"] = self._deep_messages
+                    # ③ Pre-filter deep_messages by time range
+                    # ④ Sessions skipped (last_active is string, parsing complex)
+                    data = self._deep_messages
+                    if has_time_filter:
+                        data = [m for m in data
+                                if (start_ts is None or m["timestamp"] >= start_ts)
+                                and (end_ts is None or m["timestamp"] < end_ts)]
+                    if data:
+                        stores["deep_messages"] = data
         else:
-            # Light mode: search session summaries
+            # Light mode: search session summaries (④ no time filter on sessions)
             if include_sessions and self._sessions:
                 stores["sessions"] = self._sessions
 
@@ -840,7 +863,11 @@ class SnowSearchEngine:
         # Determine sort mode — affects how many hits we pull per searcher
         sort = args.get("sort", "relevance")
         # Chronological sort needs more raw data to avoid score-based pre-cutting
-        searcher_limit = limit * 10 if sort in ("oldest", "newest") else limit
+        # Time-filter-only (no query) needs higher limit for full range output
+        if has_time_filter and not query_tokens:
+            searcher_limit = max(limit * 10, 200)
+        else:
+            searcher_limit = limit * 10 if sort in ("oldest", "newest") else limit
 
         hits = []
         with ThreadPoolExecutor(max_workers=len(stores)) as ex:
@@ -883,7 +910,7 @@ class SnowSearchEngine:
                 import datetime
                 search_info["date_range"] = f"{datetime.datetime.fromtimestamp(self._deep_earliest_ts).strftime('%b %d')} ~ {datetime.datetime.fromtimestamp(self._deep_latest_ts).strftime('%b %d')}"
 
-        return json.dumps({
+        result = {
             "success": True,
             "query": query,
             "hits": hits,
@@ -895,14 +922,26 @@ class SnowSearchEngine:
                 "deep_messages": bool(self._deep_messages),
             },
             "search_info": search_info,
-        }, ensure_ascii=False)
+        }
+
+        # ⑥ Include filtered_time_range when time filter was applied
+        if has_time_filter:
+            result["filtered_time_range"] = {
+                "start_timestamp": start_ts,
+                "end_timestamp": end_ts,
+            }
+
+        return json.dumps(result, ensure_ascii=False)
 
     def _make_searcher(self, store_name: str, data: list[dict], tokens: set[str], limit: int):
-        """Return a callable that searches one store."""
+        """Return a callable that searches one store.
+
+        When tokens is empty (time-filter-only mode), every item gets score=1.0.
+        """
         def _search():
             scored = []
             for item in data:
-                score = self._score_item(store_name, tokens, item)
+                score = self._score_item(store_name, tokens, item) if tokens else 1.0
                 if score > 0:
                     entry = {"source": store_name, "score": round(score, 3)}
                     entry["content"] = self._format_item(store_name, item)
