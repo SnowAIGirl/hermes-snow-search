@@ -13,9 +13,9 @@ Searches all stores in parallel — results in <1ms. Supports full message-body 
 
 | # | Advantage | Detail |
 |---|-----------|--------|
-| 1 | **Sub-millisecond** | RAM-resident search. No I/O, no SQLite — results in <1ms |
+| 1 | **<50ms search** | RAM-resident with inverted index. 193K messages → <50ms per query. No disk I/O on search |
 | 2 | **5 sources in parallel** | Sessions + holographic facts + built-in memory + skill metadata + full message bodies. Searched concurrently via `ThreadPoolExecutor` |
-| 3 | **Deep search** | Full message-body index with session_id, timestamp, role. Covers 12K+ messages across all sessions |
+| 3 | **Deep search** | Full message-body index with session_id, timestamp, role. Covers 190K+ messages across 500+ sessions (~34 days) |
 | 4 | **Auto-cleanup** | `post_llm_call` hook clears tool output from context. 107 hits / ~34K chars → clean slate (~7K fixed overhead) before next turn |
 | 5 | **Cross-session** | Not limited to current conversation. Searches every past session in one go |
 | 6 | **Hot reload** | `snow reload` rebuilds the RAM index from disk. No Hermes restart needed |
@@ -31,7 +31,7 @@ Searches all stores in parallel — results in <1ms. Supports full message-body 
 3. **Parallel search** — `ThreadPoolExecutor` runs all stores concurrently
 4. **Incremental updates** — `post_tool_call` hook catches `fact_store add` and `memory add` → appends to cache
 5. **Eviction** — `pre_llm_call` hook checks memory usage; evicts oldest/lowest-trust entries when >80% of limit
-6. **Deep search** — full message-body index with session_id + timestamp + role. Incremental refresh via `SELECT MAX(id)`
+6. **Deep search** — full message-body index with session_id + timestamp + role. One bulk SQL query loads all messages. CJK-only 2-gram tokenizer + intersection filtering for fast search
 7. **Skills cache** — `~/.hermes/skills/*/SKILL.md` frontmatter (name, description, tags) pre-loaded on startup
 
 ## Installation
@@ -47,7 +47,7 @@ hermes plugins enable hermes-snow-search
 ```yaml
 plugins:
   hermes-snow-search:
-    memory_limit_mb: 200          # safety cap, not actual usage
+    memory_limit_mb: 500          # safety cap, not actual usage
     session_max: 7000
     fact_max: 10000
     deep_search_enabled: true     # set false to use lightweight only
@@ -56,18 +56,18 @@ plugins:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `memory_limit_mb` | 200 | Hard memory cap; eviction triggers at 80% |
+| `memory_limit_mb` | 500 | Hard memory cap; eviction triggers at 80% |
 | `session_max` | 7000 | Max session entries in lightweight cache |
 | `fact_max` | 10000 | Max fact entries in cache |
 | `deep_search_enabled` | true | Enables full message-body search. Set `false` for lightweight-only mode |
 | `deep_search_load_mode` | ondemand | `ondemand` = load on first search, `startup` = background at boot |
 
-> `memory_limit_mb` (200 MB) is a safety cap, not actual usage. One week of real conversation (~230 sessions, ~10,000 messages) fits in ~6 MB of lightweight data, ~6 MB additional for deep search.
+> `memory_limit_mb` (500 MB) is a safety cap, not actual usage. One month of real conversation (~530 sessions, ~193K messages) fits in ~92 MB of deep search data.
 
 ### Memory Recommendations
 
 - **Lightweight mode:** 20 MB is sufficient for session summaries, facts, memory, and skills. Set `deep_search_enabled: false` to stay in lightweight mode.
-- **Deep search (default):** Full message bodies consume ~6 MB/week. 200 MB covers ~6 months, 500 MB covers ~1 year.
+- **Deep search (default):** Full message bodies consume ~92 MB/month (193K messages over 34 days). 500 MB covers ~6 months.
 - **Multiple profiles:** When running multiple Hermes profiles, budget N × `memory_limit_mb` since each process has its own in-memory index.
 
 ## Context Cleanup (post_llm_call)
@@ -99,12 +99,13 @@ Enabled by default (`deep_search_enabled: true`). When active, full message-body
 Progress is written to stderr:
 
 ```
-[Hermes Snow Search] Loading deep search index...
-[Hermes Snow Search] Session 65/263 | 3,000 messages | 15/200 MB | ~0.5s remaining
-[Hermes Snow Search] Deep search ready | 12,000 messages | 10 days (May 13 ~ May 22) | 7.5 MB
+  ┊ ❄️ [Hermes Snow Search] Loading deep search index: 532 sessions (532 total)...
+  ┊ ❄️ [Hermes Snow Search]   SQL: 193,139 messages fetched
+  ┊ ❄️ [Hermes Snow Search] Deep search ready | 193,139 messages | 34 days (May 13 ~ Jun 16) | 92 MB | 10.0s
+  ┊ ❄️ [Hermes Snow Search] All chat data loaded -- full coverage, no eviction
 ```
 
-Index builds from newest sessions backwards, stops at 85% of `memory_limit_mb`. Subsequent calls use `SELECT MAX(id)` for incremental refresh — cross-process sync is automatic (shared state.db).
+One bulk SQL query loads all messages. Inverted index built once at load time. No per-search I/O.
 
 ### Sort modes
 
@@ -116,12 +117,12 @@ Index builds from newest sessions backwards, stops at 85% of `memory_limit_mb`. 
 
 ### Performance
 
-| Mode | Searches | Latency | Memory (1 week) |
-|------|----------|---------|-----------------|
-| Lightweight | Session summaries | <0.5ms | ~3 MB |
-| Deep | Full message bodies | ~1-5ms | ~6 MB |
+| Mode | Searches | Latency | Memory (34 days) |
+|------|----------|---------|------------------|
+| Lightweight | Session summaries | <1ms | ~3 MB |
+| Deep | Full message bodies | <50ms | ~92 MB (193K msg) |
 
-Lightweight and deep mode never load simultaneously — deep mode skips sessions and loads facts + memory + messages.
+Load time: ~5s (SQL) + ~5s (index build) for 193K messages. Lightweight and deep mode never load simultaneously — deep mode skips sessions and loads facts + memory + messages.
 
 ## Action Modes
 
@@ -163,7 +164,7 @@ Check `search_info.full_coverage` — if `true`, snow_search covers everything. 
 
 ## Caveats
 
-- **First use delay (ondemand):** First deep search triggers index building (~1s for ~1 week).
+- **Load time:** ~10s to load and index ~193K messages from state.db. Searches are <50ms after load.
 - **Root sessions only:** Deep search indexes user ↔ assistant conversations. Subagent sessions (delegate_task children) are excluded.
 - **Tool messages excluded:** Only `user` and `assistant` role messages are stored.
 - **Partial coverage:** When `full_coverage` is false, combine with `session_search` for complete results.

@@ -10,9 +10,9 @@ Hermes Agent 的内存级并行搜索插件。全量加载到 RAM，多路并发
 
 | # | 优势 | 说明 |
 |---|------|------|
-| 1 | **毫秒级** | 驻内存搜索，不走磁盘不走 SQLite，结果 <1ms |
+| 1 | **<50ms 检索** | 驻内存 + 倒排索引。193K 条消息 → <50ms 每次查询。搜索不走磁盘 |
 | 2 | **5 源并行** | sessions + holographic facts + built-in memory + skill metadata + 全量消息正文，ThreadPoolExecutor 多路并发 |
-| 3 | **深度搜索** | 完整消息正文索引（含 session_id、timestamp、role），覆盖 12K+ 条历史消息 |
+| 3 | **深度搜索** | 完整消息正文索引（含 session_id、timestamp、role），覆盖 190K+ 条消息（~34 天） |
 | 4 | **自动清理上下文** | post_llm_call 钩子清空搜索结果。实测 107 条/34K 字符 → 下一轮只剩 ~7K 固定负载 |
 | 5 | **跨会话** | 不限于当前对话，一次搜索覆盖所有历史 session |
 | 6 | **热重载** | snow reload 从磁盘重建 RAM 索引，无需重启 Hermes |
@@ -28,7 +28,7 @@ Hermes Agent 的内存级并行搜索插件。全量加载到 RAM，多路并发
 3. **并行搜索** — ThreadPoolExecutor 多路并发
 4. **增量更新** — post_tool_call 钩子捕获写入，追加缓存
 5. **自动淘汰** — 超 80% 内存上限时淘汰最旧条目
-6. **深度搜索** — 完整消息正文索引，含 session_id + timestamp + role，增量刷新
+6. **深度搜索** — 完整消息正文索引，一条批量 SQL 加载全部消息。CJK-only 2-gram 分词 + 交集过滤实现快速检索
 7. **技能缓存** — `~/.hermes/skills/*/SKILL.md` frontmatter 启动时预加载
 
 ## 安装
@@ -44,7 +44,7 @@ hermes plugins enable hermes-snow-search
 ```yaml
 plugins:
   hermes-snow-search:
-    memory_limit_mb: 200          # 安全上限，非实际开销
+    memory_limit_mb: 500          # 安全上限，非实际开销
     session_max: 7000
     fact_max: 10000
     deep_search_enabled: true     # 设为 false 仅用轻量模式
@@ -53,18 +53,18 @@ plugins:
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `memory_limit_mb` | 200 | 内存硬上限，达 80% 触发淘汰 |
+| `memory_limit_mb` | 500 | 内存硬上限，达 80% 触发淘汰 |
 | `session_max` | 7000 | 轻量缓存最大 session 数 |
 | `fact_max` | 10000 | 最大事实条目数 |
 | `deep_search_enabled` | true | 开启完整消息正文搜索。设为 false 仅用轻量模式 |
 | `deep_search_load_mode` | ondemand | ondemand = 首次搜索时加载，startup = 启动时后台加载 |
 
-> 200 MB 是安全上限，不是实际开销。一周真实对话（~230 session、~10,000 条消息）轻量数据约 6 MB，深度搜索另需约 6 MB。
+> 500 MB 是安全上限，不是实际开销。一个月真实对话（~530 session、~193K 条消息）深度搜索约 92 MB。
 
 ### 内存建议
 
 - **轻量模式：** 20 MB 足够存放 session 摘要、facts、memory、skills。设置 `deep_search_enabled: false` 即可使用轻量模式。
-- **深度搜索（默认）：** 完整消息正文约 6 MB/周。200 MB 覆盖约 6 个月，500 MB 覆盖约 1 年。
+- **深度搜索（默认）：** 完整消息正文约 92 MB/月（193K 条/34 天）。500 MB 覆盖约 6 个月。
 - **多 profile：** 运行多个 Hermes profile 时，预算 N × `memory_limit_mb`，因为每个进程持有独立的内存索引。
 
 ## 上下文清理（post_llm_call）
@@ -94,12 +94,13 @@ for msg in history:
 | `startup` | 后台 2.5 秒 | 不阻塞，打印 ~0/50/100% 进度 |
 
 ```
-[Hermes Snow Search] Loading deep search index...
-[Hermes Snow Search] Session 65/263 | 3,000 messages | 15/200 MB | ~0.5s remaining
-[Hermes Snow Search] Deep search ready | 12,000 messages | 10 days (May 13 ~ May 22) | 7.5 MB
+  ┊ ❄️ [Hermes Snow Search] Loading deep search index: 532 sessions (532 total)...
+  ┊ ❄️ [Hermes Snow Search]   SQL: 193,139 messages fetched
+  ┊ ❄️ [Hermes Snow Search] Deep search ready | 193,139 messages | 34 days (May 13 ~ Jun 16) | 92 MB | 10.0s
+  ┊ ❄️ [Hermes Snow Search] All chat data loaded -- full coverage, no eviction
 ```
 
-从最新 session 反向加载，到 85% 内存上限停止。后续调用增量刷新，跨进程自动同步。
+一条批量 SQL 加载全部消息。倒排索引在加载时一次性构建。搜索时零 I/O。
 
 ### 排序模式
 
@@ -111,12 +112,12 @@ for msg in history:
 
 ### 性能
 
-| 模式 | 搜索范围 | 延迟 | 内存（周数据） |
-|------|----------|------|---------------|
-| 轻量 | Session 摘要 | <0.5ms | ~3 MB |
-| 深度 | 完整消息正文 | ~1-5ms | ~6 MB |
+| 模式 | 搜索范围 | 延迟 | 内存（34 天） |
+|------|----------|------|--------------|
+| 轻量 | Session 摘要 | <1ms | ~3 MB |
+| 深度 | 完整消息正文 | <50ms | ~92 MB（193K 条） |
 
-轻量与深度互斥——深度模式跳过 session 摘要，仅加载 facts + memory + messages。
+加载时间：~5s（SQL）+ ~5s（建索引）/193K 条消息。轻量与深度互斥——深度模式跳过 session 摘要，仅加载 facts + memory + messages。
 
 ## 操作模式
 
@@ -158,7 +159,7 @@ for msg in history:
 
 ## 注意事项
 
-- **首次延迟：** 首次深度搜索触发索引构建（~1 秒/周数据）。
+- **加载时间：** 从 state.db 加载并索引 ~193K 条消息约需 10 秒。加载后搜索 <50ms。
 - **仅根会话：** 只索引顶层对话，子 agent 排除。
 - **不索引工具输出：** 仅 user/assistant 角色消息。
 - **部分覆盖：** 当 `full_coverage` 为 false 时，结合 `session_search` 获取完整结果。
