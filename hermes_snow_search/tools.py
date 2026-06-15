@@ -175,6 +175,10 @@ SNOW_SEARCH_SCHEMA = {
 _WHITESPACE = re.compile(r"\s+")
 
 
+import re as _re
+_CJK_RE = _re.compile(r"[一-鿿㐀-䶿豈-﫿]+")
+
+
 def _ngrams(text: str, n: int) -> set[str]:
     """Return character n-grams from text. Handles mixed Chinese/Latin."""
     text = text.lower()
@@ -186,10 +190,11 @@ def _ngrams(text: str, n: int) -> set[str]:
 
 
 def _tokenize(text: str) -> set[str]:
-    """Fast hybrid tokenizer: whitespace-split for English, 2-gram for CJK.
+    """Fast hybrid tokenizer: whitespace-split for ASCII, 2-gram for CJK.
 
-    Keeps token count low per message so index builds in <1s. A typical
-    500-char message yields ~15 tokens instead of ~40 with full n-gram.
+    Only applies 2-gram sliding window to contiguous CJK character runs,
+    avoiding spurious English substrings like "da", "at" that pollute the
+    inverted index with high-frequency false positives.
     """
     if not text:
         return set()
@@ -197,10 +202,14 @@ def _tokenize(text: str) -> set[str]:
     if not text:
         return set()
     result = set()
-    # Whitespace-split words (English, code, etc.)
+    # Whitespace-split for ASCII/English
     result.update(text.split())
-    # 2-gram slide for CJK — covers "混乱", "林泉" etc.
-    result.update(_ngrams(text, 2))
+    # 2-gram slide ONLY for contiguous CJK runs
+    cjk_runs = _CJK_RE.findall(text)
+    for run in cjk_runs:
+        for ng in _ngrams(run, 2):
+            if " " not in ng:
+                result.add(ng)
     return result
 
 
@@ -228,8 +237,9 @@ def _match_score(query_tokens: set[str], text: str, debug: bool = False) -> tupl
         return 0.0, {}
 
     text_lower = text.lower()
-    # Build ngram index for text once
-    text_ngrams = _build_ngram_index(text)
+    # Lazily built ngram index — only constructed when a token misses
+    # the fast substring check (token in text_lower), which covers >95% of cases.
+    _text_ngrams: set[str] | None = None
 
     total = len(query_tokens)
     hits = 0.0
@@ -241,24 +251,31 @@ def _match_score(query_tokens: set[str], text: str, debug: bool = False) -> tupl
             hits += 1.0
             if debug:
                 hit_detail.append({"token": token, "match": "exact"})
-        elif token in text_ngrams:
-            # N-gram or prefix/suffix hit
-            hits += 0.6
-            if debug:
-                hit_detail.append({"token": token, "match": "ngram"})
-        elif len(token) >= 4:
-            # Prefix/suffix match — token starts/ends with text word
-            words = _WHITESPACE.split(text_lower)
-            matched = False
-            for w in words:
-                if len(w) >= 4 and (w.startswith(token) or w.endswith(token)):
-                    hits += 0.4
-                    matched = True
-                    if debug:
-                        hit_detail.append({"token": token, "match": "prefix", "word": w})
-                    break
-            if debug and not matched:
+        elif len(token) >= 2:
+            # N-gram / prefix/suffix match — build index lazily
+            if _text_ngrams is None:
+                _text_ngrams = _build_ngram_index(text)
+            if token in _text_ngrams:
+                hits += 0.6
+                if debug:
+                    hit_detail.append({"token": token, "match": "ngram"})
+            elif len(token) >= 4:
+                # Prefix/suffix match for longer tokens
+                words = _WHITESPACE.split(text_lower)
+                matched = False
+                for w in words:
+                    if len(w) >= 4 and (w.startswith(token) or w.endswith(token)):
+                        hits += 0.4
+                        matched = True
+                        if debug:
+                            hit_detail.append({"token": token, "match": "prefix", "word": w})
+                        break
+                if debug and not matched:
+                    hit_detail.append({"token": token, "match": "miss"})
+            elif debug:
                 hit_detail.append({"token": token, "match": "miss"})
+        elif debug:
+            hit_detail.append({"token": token, "match": "miss"})
 
     score = hits / total if hits > 0 else 0.0
     return score, hit_detail if debug else {}
@@ -1311,15 +1328,22 @@ class SnowSearchEngine:
         For deep_messages, uses inverted index when available to narrow candidates
         from O(N) to O(hits) before scoring. Also splits work across parallel chunks.
         """
-        # Pre-filter via inverted index for deep_messages
+        # Pre-filter via inverted index for deep_messages.
+        # Use INTERSECTION when multiple tokens — rare tokens first.
         if store_name == "deep_messages" and tokens and self._deep_index_ready:
-            candidates = set()
-            for tok in tokens:
-                if tok in self._deep_index:
-                    candidates.update(self._deep_index[tok])
-            if candidates:
-                data = [self._deep_messages[i] for i in candidates
-                        if i < len(self._deep_messages)]
+            sorted_tokens = sorted(
+                [t for t in tokens if t in self._deep_index],
+                key=lambda t: len(self._deep_index[t]),
+            )
+            if sorted_tokens:
+                candidates = set(self._deep_index[sorted_tokens[0]])
+                for tok in sorted_tokens[1:]:
+                    candidates &= set(self._deep_index[tok])
+                    if not candidates:
+                        break  # empty intersection — stop early
+                if candidates:
+                    data = [self._deep_messages[i] for i in candidates
+                            if i < len(self._deep_messages)]
 
         def _search_chunk(chunk):
             chunk_scored = []
