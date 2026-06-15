@@ -1155,6 +1155,7 @@ class SnowSearchEngine:
         **kwargs,
     ) -> str:
         """Tool handler: parallel search across all loaded stores."""
+        _t0 = time.time()
         query = args.get("query", "")
         limit = min(int(args.get("limit_per_source", 5)), 20)
         include_sessions = args.get("include_sessions", True)
@@ -1314,7 +1315,12 @@ class SnowSearchEngine:
                 "start_timestamp": start_ts,
                 "end_timestamp": end_ts,
             }
-        
+
+        _elapsed = time.time() - _t0
+        if _elapsed > 1.0:
+            _emit(f"search \"{query}\" took {_elapsed:.1f}s "
+                  f"(deep={deep}, stores={list(stores.keys())}, hits={total})")
+
         return json.dumps(result, ensure_ascii=False)
 
     def _make_searcher(self, store_name: str, data: list[dict], tokens: set[str], limit: int, debug: bool = False, min_confidence: float = 0.5):
