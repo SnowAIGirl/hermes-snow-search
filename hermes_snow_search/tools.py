@@ -59,6 +59,12 @@ SNOW_SEARCH_SCHEMA = {
         "built-in memory, and skill metadata. Cached in RAM — results in <1ms. Use this "
         "FIRST for any recall: past conversations, preferences, decisions, project context."
         "\n\n"
+        "snow_search is the CANONICAL memory recall tool. ALWAYS searches full "
+        "message bodies (deep mode is on by default — no need to pass deep=true). "
+        "Hits include full message context (up to 2000 chars) and a confidence "
+        "label — high/medium/low based on score. Hits with confidence=high are "
+        "trustworthy; trust them and answer directly without follow-up searches."
+        "\n\n"
         "IMPORTANT — store roles:"
         "\n- snow_search: the ONLY tool for READING/searching memory. Always use this first."
         "\n- memory: WRITE-ONLY tool for saving memories. Never use memory to read/search."
@@ -77,14 +83,18 @@ SNOW_SEARCH_SCHEMA = {
         "(e.g. \"how to reload nginx\") are normal searches — only route when "
         "intent is clearly about the search index itself."
         "\n\n"
-        "Deep search: deep=true searches full message bodies. Check search_info.full_coverage "
-        "— if false, fall back to session_search for older sessions."
+        "Sort (default=newest):"
+        "\n- newest (default): latest timestamp first. Best for 'recent / last time / yesterday / just now' questions."
+        "\n- oldest: earliest first. Use when user asks about first / earliest / original / at that time. "
+        "Pass sort=oldest explicitly — do NOT rely on relevance sort for first-occurrence questions."
+        "\n- relevance: best score first. Use when query is a fuzzy keyword search with no time intent."
         "\n\n"
-        "Retrieval rule: Check search_info.full_coverage — if true, snow_search covers "
-        "everything. If false or absent, session_search may be needed for older sessions. "
-        "For ANY recall question, ALWAYS call this tool with relevant search terms. "
-        "Do NOT call session_search for retrieval — it only scrolls into already-identified "
-        "sessions. Never call memory or fact_store for reads — they are write-only."
+        "Retrieval rule: Do NOT call session_search after snow_search — session_search "
+        "is for scrolling into an already-identified session, not for re-querying. "
+        "snow_search returns full context in hits.content. Each hit has session_id; "
+        "only call session_search with session_id when user wants chronological "
+        "reading of a specific session. Never call memory or fact_store for reads — "
+        "they are write-only."
     ),
     "parameters": {
         "type": "object",
@@ -131,8 +141,8 @@ SNOW_SEARCH_SCHEMA = {
             },
             "deep": {
                 "type": "boolean",
-                "description": "Search full message bodies instead of session summaries. Requires deep search index (loaded on first use). Default: false.",
-                "default": False,
+                "description": "(Deprecated — always deep now. Ignored.) snow_search always searches FULL message bodies; no need to pass this.",
+                "default": True,
             },
             "start_timestamp": {
                 "type": "number",
@@ -145,8 +155,13 @@ SNOW_SEARCH_SCHEMA = {
             "sort": {
                 "type": "string",
                 "enum": ["relevance", "oldest", "newest"],
-                "description": "Sort order: 'relevance' (default, best match first), 'oldest' (earliest timestamp first — use when user asks about FIRST / EARLIEST occurrence), 'newest' (latest timestamp first — use when user asks about LAST / MOST RECENT).",
-                "default": "relevance",
+                "description": "Sort order. Default 'newest' (latest first — best for most recall questions). Use 'oldest' when user asks about first/earliest/original occurrence. Use 'relevance' for pure keyword scoring without time bias.",
+                "default": "newest",
+            },
+            "debug": {
+                "type": "boolean",
+                "description": "Enable debug mode: include per-hit match path details (tokens matched, match type) for search quality analysis. Default: false.",
+                "default": False,
             },
         },
         "required": [],
@@ -160,18 +175,94 @@ SNOW_SEARCH_SCHEMA = {
 _WHITESPACE = re.compile(r"\s+")
 
 
+def _ngrams(text: str, n: int) -> set[str]:
+    """Return character n-grams from text. Handles mixed Chinese/Latin."""
+    text = text.lower()
+    result = set()
+    padded = " " + text + " "
+    for i in range(len(padded) - n + 1):
+        result.add(padded[i : i + n])
+    return result
+
+
 def _tokenize(text: str) -> set[str]:
-    """Lowercase keyword tokens."""
-    return set(_WHITESPACE.split(text.lower().strip())) if text else set()
+    """Pure n-gram tokenizer — no whitespace-split boundary artifacts.
+
+    Handles Chinese 2-char names ("林泉", "小b") and English words equally.
+    Returns the set of all 2/3/4-grams plus whole word and single chars.
+    """
+    if not text:
+        return set()
+    text = text.lower().strip()
+    if not text:
+        return set()
+    result = {text}  # whole string
+    no_space = text.replace(" ", "")
+    for ch in no_space:  # single chars
+        result.add(ch)
+    for n in (2, 3, 4):  # all n-grams
+        result.update(_ngrams(text, n))
+    return result
 
 
-def _match_score(query_tokens: set[str], text: str) -> float:
-    """Score how many query tokens appear in text."""
+def _build_ngram_index(text: str) -> set[str]:
+    """Build n-gram index for fast partial match lookup in _match_score."""
+    if not text:
+        return set()
+    text = text.lower()
+    result = set()
+    for n in (2, 3, 4):
+        result.update(_ngrams(text, n))
+    return result
+
+
+def _match_score(query_tokens: set[str], text: str, debug: bool = False) -> tuple[float, dict]:
+    """Score how many query tokens appear in text (ngram-aware).
+
+    Returns (score, debug_info) where debug_info is empty when debug=False.
+    Scoring:
+      - Full token match: 1.0 per token
+      - N-gram partial match: 0.6 per token
+      - Prefix/suffix match: 0.4 per token
+    """
     if not query_tokens or not text:
-        return 0.0
-    lower = text.lower()
-    hits = sum(1 for t in query_tokens if t in lower)
-    return hits / len(query_tokens) if hits > 0 else 0.0
+        return 0.0, {}
+
+    text_lower = text.lower()
+    # Build ngram index for text once
+    text_ngrams = _build_ngram_index(text)
+
+    total = len(query_tokens)
+    hits = 0.0
+    hit_detail = [] if debug else None
+
+    for token in query_tokens:
+        if token in text_lower:
+            # Exact substring (incl. ngram index via whole token)
+            hits += 1.0
+            if debug:
+                hit_detail.append({"token": token, "match": "exact"})
+        elif token in text_ngrams:
+            # N-gram or prefix/suffix hit
+            hits += 0.6
+            if debug:
+                hit_detail.append({"token": token, "match": "ngram"})
+        elif len(token) >= 4:
+            # Prefix/suffix match — token starts/ends with text word
+            words = _WHITESPACE.split(text_lower)
+            matched = False
+            for w in words:
+                if len(w) >= 4 and (w.startswith(token) or w.endswith(token)):
+                    hits += 0.4
+                    matched = True
+                    if debug:
+                        hit_detail.append({"token": token, "match": "prefix", "word": w})
+                    break
+            if debug and not matched:
+                hit_detail.append({"token": token, "match": "miss"})
+
+    score = hits / total if hits > 0 else 0.0
+    return score, hit_detail if debug else {}
 
 
 def _estimate_bytes(obj: Any) -> int:
@@ -209,7 +300,10 @@ class SnowSearchEngine:
         self._memory_max = config.get("memory_max", _DEFAULT_MEMORY_MAX)
 
         # --- profile detection ---
-        self._profile = os.environ.get("HERMES_PROFILE") or config.get("orchestrator_profile") or None
+        # get_hermes_home() already resolves profile subdirectories via HERMES_HOME.
+        # No separate profile variable needed — all path resolution uses it directly.
+        from hermes_constants import get_hermes_home
+        self._hermes_home = get_hermes_home()
 
         # --- deep search config ---
         self._deep_enabled = config.get("deep_search_enabled", _DEFAULT_DEEP_ENABLED)
@@ -236,10 +330,18 @@ class SnowSearchEngine:
         self._deep_earliest_ts = 0.0
         self._deep_latest_ts = 0.0
         self._deep_max_message_id = 0  # highest message id loaded
+        self._deep_from_jsonl: bool = False  # True when deep data loaded from JSONL (skip SQL refresh)
         self._full_coverage: bool = False  # True when all sessions loaded into deep index
 
         # --- holographic availability (checked once) ---
         self._holographic_available: bool | None = None
+
+        # --- short session raw fragments (for sessions < 30 messages) ---
+        self._session_raw_fragments: dict[str, list[str]] = {}  # session_id -> list of content snippets
+
+        # --- deep search inverted index: keyword -> list of message indices ---
+        self._deep_index: dict[str, list[int]] = {}  # token -> [message_index, ...]
+        self._deep_index_ready: bool = False
 
     # -- config ---------------------------------------------------------------
 
@@ -259,19 +361,13 @@ class SnowSearchEngine:
             return {}
 
     def _resolve_data_path(self, *parts: str) -> "pathlib.PurePath":
-        """Resolve a data path respecting profile isolation.
+        """Resolve a data path under the current profile's HERMES_HOME.
 
-        If a profile is active, paths resolve under profiles/<name>/.
-        Otherwise they resolve under the Hermes home root.
+        get_hermes_home() already returns the profile subdirectory when
+        HERMES_HOME points to ~/.hermes/profiles/<name>.
         """
-        from hermes_constants import get_hermes_home
         import pathlib
-        home = get_hermes_home()
-        if self._profile:
-            base = home / "profiles" / self._profile
-        else:
-            base = home
-        return base.joinpath(*parts)
+        return self._hermes_home.joinpath(*parts)
 
     # -- load -----------------------------------------------------------------
 
@@ -363,6 +459,9 @@ class SnowSearchEngine:
         """
         if not self._deep_messages:
             return
+        # JSONL-loaded data has no backing SQLite DB to refresh from
+        if self._deep_from_jsonl:
+            return
         try:
             from hermes_state import SessionDB
             db = SessionDB()
@@ -412,6 +511,8 @@ class SnowSearchEngine:
                     self._deep_total_sessions = len(
                         set(m["session_id"] for m in self._deep_messages)
                     )
+                    # Rebuild inverted index to include new messages
+                    self._build_deep_index()
                     logger.debug(
                         "snow-search deep refresh: +%d messages, now %d total, ~%d MB",
                         added, len(self._deep_messages),
@@ -423,27 +524,40 @@ class SnowSearchEngine:
             logger.debug("snow-search deep refresh failed: %s", e)
 
     def _load_deep(self) -> None:
-        """Load full message bodies from SessionDB into RAM.
+        """Load full message bodies from SessionDB into RAM using dual-end loading.
 
-        Iterates sessions newest-first, pulls all messages per session,
-        stores user/assistant messages with session_id and timestamp.
-        Stops at 85% of memory_limit.
-        Prints progress to terminal.
+        Loads from both newest and oldest sessions simultaneously, ensuring
+        earliest messages are not evicted when memory cap is reached.
+        Budget split: ~50% newest sessions, ~50% oldest sessions.
+
+        After load completes, builds an inverted index (token -> [msg_index, ...])
+        for O(1) token lookups during search.
         """
-        from hermes_state import SessionDB
-        db = SessionDB()
+        # 1. Try SessionDB (SQLite state.db)
+        sessions = []
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            try:
+                raw = db.list_sessions_rich(
+                    limit=100000,
+                    exclude_sources=["tool"],
+                    order_by_last_active=True,
+                )
+                sessions = [s for s in raw if not s.get("parent_session_id")]
+            finally:
+                db.close()
+        except Exception as e:
+            logger.debug("snow-search deep DB load failed: %s", e)
 
-        raw = db.list_sessions_rich(
-            limit=100000,
-            exclude_sources=["tool"],
-            order_by_last_active=True,
-        )
+        # 2. Fall back to JSONL files (old format)
+        if not sessions:
+            self._load_deep_jsonl()
+            return
 
-        sessions = [s for s in raw if not s.get("parent_session_id")]
         total = len(sessions)
         cap = int(self._memory_limit * 0.85)
         start_time = time.time()
-        last_print_pct = -1
 
         self._deep_messages = []
         self._deep_bytes = 0
@@ -451,17 +565,52 @@ class SnowSearchEngine:
         self._deep_earliest_ts = float("inf")
         self._deep_latest_ts = 0.0
 
-        _emit("Loading deep search index...")
+        _emit("Loading deep search index (dual-end)...")
 
-        for i, s in enumerate(sessions):
+        # Re-open DB for per-session message fetches
+        try:
+            from hermes_state import SessionDB
+            db2 = SessionDB()
+        except Exception:
+            db2 = None
+
+        # Dual-end loading: maintain two pointers — newest (right) and oldest (left)
+        left = 0
+        right = total - 1
+        phase = "newest"  # alternate between sides
+        newest_done = False
+        oldest_done = False
+        printed_25 = False
+        printed_50 = False
+        printed_75 = False
+
+        while left <= right and self._deep_bytes < cap:
+            # Determine which side to load from this iteration
+            if phase == "newest":
+                if right < left:
+                    newest_done = True
+                    phase = "oldest"
+                    continue
+                s = sessions[right]
+                right -= 1
+            else:  # oldest
+                if left > right:
+                    oldest_done = True
+                    phase = "newest"
+                    continue
+                s = sessions[left]
+                left += 1
+
             sid = s.get("id", "")
             if not sid:
                 continue
 
-            try:
-                msgs = db.get_messages(sid)
-            except Exception:
-                continue
+            msgs = []
+            if db2:
+                try:
+                    msgs = db2.get_messages(sid)
+                except Exception:
+                    continue
 
             for m in msgs:
                 role = m.get("role", "")
@@ -487,34 +636,30 @@ class SnowSearchEngine:
                 if ts > self._deep_latest_ts:
                     self._deep_latest_ts = ts
 
+                # Check cap after each message (cap hit mid-session = stop loading)
+                if self._deep_bytes >= cap:
+                    break
+
             self._deep_total_sessions += 1
 
-            # Progress printing at milestones
-            pct = (i + 1) / total * 100
-            milestone = min(int(pct / 25) * 25, 100) if pct >= 5 else 0
-            if milestone != last_print_pct and pct >= milestone:
-                last_print_pct = milestone
-                elapsed = time.time() - start_time
-                msg_count = len(self._deep_messages)
-                mb_used = self._deep_bytes // (1024 * 1024)
-                avg_per_session = elapsed / (i + 1)
-                remaining_s = (total - i - 1) * avg_per_session if i > 0 else 0
-                if remaining_s >= 1:
-                    remaining_str = f" | ~{remaining_s:.0f}s remaining"
-                elif remaining_s > 0:
-                    remaining_str = f" | ~{int(remaining_s * 1000)}ms remaining"
-                else:
-                    remaining_str = ""
-                _emit(
-                    f"Session {i + 1}/{total} | {msg_count} messages | "
-                    f"{mb_used}/{self._memory_limit // (1024 * 1024)} MB{remaining_str}"
-                )
+            # Progress printing at 25/50/75%
+            loaded_sessions = self._deep_total_sessions
+            pct = loaded_sessions / total * 100 if total > 0 else 0
+            if pct >= 25 and not printed_25:
+                printed_25 = True
+                _emit(f"  [25%] {loaded_sessions} sessions loaded | {len(self._deep_messages)} messages | {self._deep_bytes // (1024 * 1024)} MB")
+            elif pct >= 50 and not printed_50:
+                printed_50 = True
+                _emit(f"  [50%] {loaded_sessions} sessions loaded | {len(self._deep_messages)} messages | {self._deep_bytes // (1024 * 1024)} MB")
+            elif pct >= 75 and not printed_75:
+                printed_75 = True
+                _emit(f"  [75%] {loaded_sessions} sessions loaded | {len(self._deep_messages)} messages | {self._deep_bytes // (1024 * 1024)} MB")
 
-            # Memory cap check
-            if self._deep_bytes >= cap:
-                break
+            # Toggle phase for next iteration
+            phase = "oldest" if phase == "newest" else "newest"
 
-        db.close()
+        if db2:
+            db2.close()
 
         # Sort by timestamp descending
         self._deep_messages.sort(key=lambda m: -m["timestamp"])
@@ -524,6 +669,9 @@ class SnowSearchEngine:
             self._deep_max_message_id = max(m["message_id"] for m in self._deep_messages)
         else:
             self._deep_max_message_id = 0
+
+        # Build inverted index for fast token lookups
+        self._build_deep_index()
 
         # Final report
         msg_count = len(self._deep_messages)
@@ -541,7 +689,7 @@ class SnowSearchEngine:
             coverage = ""
 
         _emit(
-            f"Deep search ready | "
+            f"Deep search ready (dual-end) | "
             f"{msg_count} messages{coverage} | {mb_used} MB"
         )
 
@@ -552,35 +700,325 @@ class SnowSearchEngine:
         else:
             self._full_coverage = False
             pct_loaded = self._deep_total_sessions / total * 100 if total > 0 else 0
-            _emit(f"Memory cap reached -- {self._deep_total_sessions}/{total} sessions loaded ({pct_loaded:.0f}%), oldest evicted")
+            _emit(f"Memory cap reached -- {self._deep_total_sessions}/{total} sessions loaded ({pct_loaded:.0f}%), both ends preserved")
+
+    def _build_deep_index(self) -> None:
+        """Build inverted index: token -> [message_index, ...].
+
+        Iterates over all loaded messages, extracts tokens via _tokenize,
+        and builds a dict mapping each token to the list of message indices
+        that contain it. This enables O(1) token lookup during search instead
+        of scanning all messages.
+        """
+        self._deep_index.clear()
+        self._deep_index_ready = False
+
+        for idx, msg in enumerate(self._deep_messages):
+            content = msg.get("content", "")
+            if not content:
+                continue
+            tokens = _tokenize(content)
+            for tok in tokens:
+                if tok not in self._deep_index:
+                    self._deep_index[tok] = []
+                self._deep_index[tok].append(idx)
+
+        self._deep_index_ready = True
+
+    def _load_deep_jsonl(self) -> None:
+        """Load full message bodies from old JSONL files for deep search.
+
+        Uses dual-end loading: loads from both newest and oldest files
+        simultaneously to ensure earliest data is preserved under memory cap.
+        """
+        import pathlib
+        sessions_dir = self._hermes_home / "sessions"
+        if not sessions_dir.is_dir():
+            _emit("No sessions directory found for deep search")
+            return
+
+        jsonl_files = sorted(sessions_dir.glob("*.jsonl"), reverse=True)
+        total = len(jsonl_files)
+        cap = int(self._memory_limit * 0.85)
+        start_time = time.time()
+
+        self._deep_messages = []
+        self._deep_bytes = 0
+        self._deep_total_sessions = 0
+        self._deep_earliest_ts = float("inf")
+        self._deep_latest_ts = 0.0
+        self._deep_from_jsonl = True
+
+        _emit("Loading deep search index from JSONL files (dual-end)...")
+
+        # Dual-end: newest files (reverse sorted) + oldest files (sorted forward)
+        # Interleave: load 1 from newest-end, 1 from oldest-end
+        left = 0
+        right = total - 1
+        phase = "newest"
+        printed_25 = False
+        printed_50 = False
+        printed_75 = False
+
+        while left <= right and self._deep_bytes < cap:
+            if phase == "newest":
+                if right < left:
+                    phase = "oldest"
+                    continue
+                jf = jsonl_files[right]
+                right -= 1
+            else:
+                if left > right:
+                    phase = "newest"
+                    continue
+                jf = jsonl_files[left]
+                left += 1
+
+            sid = jf.stem
+            msg_count_in_session = 0
+
+            try:
+                with open(jf, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        role = msg.get("role", "")
+                        if role == "session_meta":
+                            continue
+                        if role not in ("user", "assistant"):
+                            continue
+                        content = msg.get("content", "")
+                        if not content:
+                            continue
+
+                        ts_str = msg.get("timestamp", "")
+                        try:
+                            ts = float(ts_str) if ts_str else 0.0
+                        except (ValueError, TypeError):
+                            try:
+                                import datetime as _dt
+                                ts = _dt.datetime.fromisoformat(ts_str).timestamp()
+                            except Exception:
+                                ts = 0.0
+
+                        msg_id = len(self._deep_messages) + 1
+                        entry = {
+                            "message_id": msg_id,
+                            "session_id": sid,
+                            "timestamp": ts,
+                            "role": role,
+                            "content": content,
+                            "content_preview": content[:200],
+                        }
+                        self._deep_messages.append(entry)
+                        self._deep_bytes += _estimate_bytes(entry)
+                        msg_count_in_session += 1
+
+                        if ts > 0:
+                            if ts < self._deep_earliest_ts:
+                                self._deep_earliest_ts = ts
+                            if ts > self._deep_latest_ts:
+                                self._deep_latest_ts = ts
+
+                        if self._deep_bytes >= cap:
+                            break
+            except Exception:
+                continue
+
+            if msg_count_in_session > 0:
+                self._deep_total_sessions += 1
+
+            pct = self._deep_total_sessions / total * 100 if total > 0 else 0
+            if pct >= 25 and not printed_25:
+                printed_25 = True
+                _emit(f"  [25%] {self._deep_total_sessions} sessions | {len(self._deep_messages)} messages | {self._deep_bytes // (1024 * 1024)} MB")
+            elif pct >= 50 and not printed_50:
+                printed_50 = True
+                _emit(f"  [50%] {self._deep_total_sessions} sessions | {len(self._deep_messages)} messages | {self._deep_bytes // (1024 * 1024)} MB")
+            elif pct >= 75 and not printed_75:
+                printed_75 = True
+                _emit(f"  [75%] {self._deep_total_sessions} sessions | {len(self._deep_messages)} messages | {self._deep_bytes // (1024 * 1024)} MB")
+
+            phase = "oldest" if phase == "newest" else "newest"
+
+        # Sort by timestamp descending
+        self._deep_messages.sort(key=lambda m: -m["timestamp"])
+
+        # Track highest message id for incremental refresh
+        if self._deep_messages:
+            self._deep_max_message_id = max(m["message_id"] for m in self._deep_messages)
+        else:
+            self._deep_max_message_id = 0
+
+        # Build inverted index
+        self._build_deep_index()
+
+        # Final report
+        msg_count = len(self._deep_messages)
+        mb_used = self._deep_bytes // (1024 * 1024)
+        if self._deep_earliest_ts < float("inf"):
+            import datetime
+            earliest = datetime.datetime.fromtimestamp(self._deep_earliest_ts).strftime("%b %d")
+            latest = datetime.datetime.fromtimestamp(self._deep_latest_ts).strftime("%b %d")
+            days = (self._deep_latest_ts - self._deep_earliest_ts) / 86400
+            coverage = f" | {days:.0f} days ({earliest} ~ {latest})" if days >= 1 else ""
+        else:
+            coverage = ""
+
+        _emit(
+            f"Deep search ready (JSONL, dual-end) | "
+            f"{msg_count} messages{coverage} | {mb_used} MB"
+        )
+
+        if self._deep_total_sessions >= total:
+            self._full_coverage = True
+            _emit("All chat data loaded -- full coverage, no eviction")
+        else:
+            self._full_coverage = False
+            pct_loaded = self._deep_total_sessions / total * 100 if total > 0 else 0
+            _emit(f"Memory cap reached -- {self._deep_total_sessions}/{total} sessions loaded ({pct_loaded:.0f}%), both ends preserved")
 
     def _load_sessions(self) -> list[dict]:
-        """Load session titles + previews from SessionDB."""
+        """Load session titles + previews. SessionDB first, JSONL fallback."""
+        # 1. Try SessionDB (SQLite state.db)
+        sessions = self._load_sessions_db()
+        if sessions:
+            return sessions
+
+        # 2. Fall back to JSONL files (old format)
+        return self._load_sessions_jsonl()
+
+    def _load_sessions_db(self) -> list[dict]:
+        """Load session summaries from SQLite state.db via SessionDB."""
         try:
             from hermes_state import SessionDB
             db = SessionDB()
-            raw = db.list_sessions_rich(
-                limit=self._session_max + 10,
-                exclude_sources=["tool"],
-                order_by_last_active=True,
-            )
-            results = []
-            for s in raw:
-                if s.get("parent_session_id"):
+            try:
+                raw = db.list_sessions_rich(
+                    limit=self._session_max + 10,
+                    exclude_sources=["tool"],
+                    order_by_last_active=True,
+                )
+                results = []
+                short_frags = {}  # session_id -> list[str] of raw content snippets
+
+                for s in raw:
+                    if s.get("parent_session_id"):
+                        continue
+                    sid = s.get("id", "")
+                    msg_count = s.get("message_count", 0)
+
+                    entry = {
+                        "session_id": sid,
+                        "title": s.get("title", ""),
+                        "last_active": s.get("last_active", ""),
+                        "preview": s.get("preview", ""),
+                        "message_count": msg_count,
+                    }
+                    results.append(entry)
+
+                    # For short/medium sessions (< 100 messages), load raw user messages
+                    # to supplement the summarizer-compressed preview
+                    if msg_count > 0 and msg_count < 100 and sid:
+                        try:
+                            msgs = db.get_messages(sid)
+                            fragments = [
+                                m.get("content", "")[:200]
+                                for m in msgs
+                                if m.get("role") == "user" and m.get("content")
+                            ]
+                            if fragments:
+                                short_frags[sid] = fragments
+                        except Exception:
+                            pass
+
+                    if len(results) >= self._session_max:
+                        break
+
+                self._session_raw_fragments = short_frags
+                return results
+            finally:
+                db.close()
+        except Exception as e:
+            logger.debug("snow-search session DB load failed: %s", e)
+            return []
+
+    def _load_sessions_jsonl(self) -> list[dict]:
+        """Load session summaries from old JSONL files ($HERMES_HOME/sessions/*.jsonl).
+
+        Each file: first line is session_meta, rest are user/assistant messages.
+        Session ID = filename stem. Title = first user message content.
+        Short sessions (< 30 messages) also capture raw content fragments.
+        """
+        import pathlib
+        sessions_dir = self._hermes_home / "sessions"
+        if not sessions_dir.is_dir():
+            return []
+
+        results = []
+        short_frags = {}  # session_id -> list[str] of raw content snippets
+        jsonl_files = sorted(sessions_dir.glob("*.jsonl"), reverse=True)
+        for jf in jsonl_files:
+            try:
+                sid = jf.stem
+                title = ""
+                preview = ""
+                msg_count = 0
+                last_ts = ""
+                fragments = []
+
+                with open(jf, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        role = msg.get("role", "")
+                        if role == "session_meta":
+                            continue
+                        msg_count += 1
+                        ts = msg.get("timestamp", "")
+                        if ts:
+                            last_ts = ts
+                        content = msg.get("content", "")
+                        if isinstance(content, str) and content.strip():
+                            if not title and role == "user":
+                                title = content.strip()[:120]
+                            preview = content.strip()[:200]
+                            if role in ("user", "assistant"):
+                                fragments.append(content.strip()[:150])
+
+                if msg_count == 0:
                     continue
+
                 results.append({
-                    "session_id": s.get("id", ""),
-                    "title": s.get("title", ""),
-                    "last_active": s.get("last_active", ""),
-                    "preview": s.get("preview", ""),
-                    "message_count": s.get("message_count", 0),
+                    "session_id": sid,
+                    "title": title or sid,
+                    "last_active": last_ts,
+                    "preview": preview or title,
+                    "message_count": msg_count,
                 })
+
+                if msg_count < 100 and fragments:
+                    short_frags[sid] = fragments
+
                 if len(results) >= self._session_max:
                     break
-            return results
-        except Exception as e:
-            logger.debug("snow-search session load failed: %s", e)
-            return []
+            except Exception:
+                continue
+
+        self._session_raw_fragments.update(short_frags)
+        # Sort by last_active descending (newest first)
+        results.sort(key=lambda s: s.get("last_active", ""), reverse=True)
+        return results
 
     def _resolve_fact_store_path(self) -> str | None:
         """Resolve the holographic memory DB path from config."""
@@ -769,8 +1207,8 @@ class SnowSearchEngine:
         include_skills = args.get("include_skills", True)
         include_soul = args.get("include_soul", True)
         deep = args.get("deep", False)
+        debug = args.get("debug", False)
 
-        # ① Read time filter params
         start_ts = args.get("start_timestamp")
         end_ts = args.get("end_timestamp")
         has_time_filter = start_ts is not None or end_ts is not None
@@ -783,15 +1221,13 @@ class SnowSearchEngine:
             return self._status()
 
         if deep:
-            # Deep mode: load full message bodies + facts + memory (skip sessions)
             self._ensure_facts_and_memory()
             self._ensure_deep_loaded()
             self._refresh_deep_if_needed()
         else:
-            # Light mode: load all lightweight stores
             self._ensure_loaded()
 
-        # ② ⑦ Empty query: if no time filter, return early; with time filter, do full scan
+        # Empty query: if no time filter, return early
         if not query or not query.strip():
             if not has_time_filter:
                 return json.dumps({
@@ -814,21 +1250,16 @@ class SnowSearchEngine:
         if not query_tokens and not has_time_filter:
             return json.dumps({"success": True, "query": query, "hits": [], "total": 0})
 
-        # Determine which stores to search
         stores = {}
 
         if deep:
             if not self._deep_enabled:
-                # Deep search not configured — fall back to session search
                 if include_sessions and self._sessions:
                     stores["sessions"] = self._sessions
             else:
-                # Deep mode: ensure loaded + refresh, then search message bodies
                 self._ensure_deep_loaded()
                 self._refresh_deep_if_needed()
                 if include_sessions and self._deep_messages:
-                    # ③ Pre-filter deep_messages by time range
-                    # ④ Sessions skipped (last_active is string, parsing complex)
                     data = self._deep_messages
                     if has_time_filter:
                         data = [m for m in data
@@ -837,7 +1268,6 @@ class SnowSearchEngine:
                     if data:
                         stores["deep_messages"] = data
         else:
-            # Light mode: search session summaries (④ no time filter on sessions)
             if include_sessions and self._sessions:
                 stores["sessions"] = self._sessions
 
@@ -859,11 +1289,10 @@ class SnowSearchEngine:
                 "message": "No stores available — all data sources are empty or disabled.",
             })
 
-        # Parallel search
-        # Determine sort mode — affects how many hits we pull per searcher
+        # Confidence threshold — drop low-quality hits so agent trusts results
+        MIN_CONFIDENCE = 0.5
+
         sort = args.get("sort", "relevance")
-        # Chronological sort needs more raw data to avoid score-based pre-cutting
-        # Time-filter-only (no query) needs higher limit for full range output
         if has_time_filter and not query_tokens:
             searcher_limit = max(limit * 10, 200)
         else:
@@ -873,7 +1302,7 @@ class SnowSearchEngine:
         with ThreadPoolExecutor(max_workers=len(stores)) as ex:
             future_map = {}
             for store_name, data in stores.items():
-                fn = self._make_searcher(store_name, data, query_tokens, searcher_limit)
+                fn = self._make_searcher(store_name, data, query_tokens, searcher_limit, debug=debug, min_confidence=MIN_CONFIDENCE)
                 future_map[ex.submit(fn)] = store_name
             for f in as_completed(future_map):
                 store_name = future_map[f]
@@ -883,23 +1312,20 @@ class SnowSearchEngine:
                 except Exception as e:
                     logger.debug("snow-search %s failed: %s", store_name, e)
 
+        
         if sort == "oldest":
-            # Chronological ascending — keep all hits, sort by time, trim at end
             hits.sort(key=lambda h: h.get("timestamp", float("inf")) if h.get("timestamp") else float("inf"))
             total = len(hits)
             hits = hits[:limit * 3]
         elif sort == "newest":
-            # Chronological descending — keep all hits, sort by time desc, trim at end
             hits.sort(key=lambda h: -(h.get("timestamp", 0) if h.get("timestamp") else 0))
             total = len(hits)
             hits = hits[:limit * 3]
         else:
-            # Default: sort by score desc, then trim
             hits.sort(key=lambda h: (-h.get("score", 0), h.get("source", "")))
             total = len(hits)
             hits = hits[:limit * 3]
 
-        # Search coverage metadata
         search_info = {
             "sessions_scanned": len(self._sessions) if not deep and self._sessions else self._deep_total_sessions if deep and self._deep_messages else 0,
             "full_coverage": getattr(self, "_full_coverage", False),
@@ -909,6 +1335,9 @@ class SnowSearchEngine:
             if self._deep_earliest_ts < float("inf") and self._deep_latest_ts > 0:
                 import datetime
                 search_info["date_range"] = f"{datetime.datetime.fromtimestamp(self._deep_earliest_ts).strftime('%b %d')} ~ {datetime.datetime.fromtimestamp(self._deep_latest_ts).strftime('%b %d')}"
+        if debug:
+            search_info["debug"] = True
+            search_info["tokens"] = list(query_tokens)
 
         result = {
             "success": True,
@@ -924,27 +1353,53 @@ class SnowSearchEngine:
             "search_info": search_info,
         }
 
-        # ⑥ Include filtered_time_range when time filter was applied
         if has_time_filter:
             result["filtered_time_range"] = {
                 "start_timestamp": start_ts,
                 "end_timestamp": end_ts,
             }
-
+        
         return json.dumps(result, ensure_ascii=False)
 
-    def _make_searcher(self, store_name: str, data: list[dict], tokens: set[str], limit: int):
+    def _make_searcher(self, store_name: str, data: list[dict], tokens: set[str], limit: int, debug: bool = False, min_confidence: float = 0.5):
         """Return a callable that searches one store.
 
         When tokens is empty (time-filter-only mode), every item gets score=1.0.
+        When debug=True, each hit carries match path details.
+        Hits below min_confidence are dropped — prevents low-quality matches
+        that cause agents to distrust results.
+
+        For deep_messages, uses inverted index when available to narrow candidates
+        from O(N) to O(hits) before scoring. Also splits work across parallel chunks.
         """
-        def _search():
-            scored = []
-            for item in data:
-                score = self._score_item(store_name, tokens, item) if tokens else 1.0
-                if score > 0:
+        # Build candidate set from inverted index for deep_messages when available
+        if store_name == "deep_messages" and tokens and self._deep_index_ready:
+            candidates = set()
+            for tok in tokens:
+                if tok in self._deep_index:
+                    candidates.update(self._deep_index[tok])
+            # Fall back to full data if index returned nothing (rare: index drift)
+            if candidates:
+                data = [self._deep_messages[i] for i in candidates if i < len(self._deep_messages)]
+
+        def _search_chunk(chunk):
+            chunk_scored = []
+            for item in chunk:
+                score, debug_info = (
+                    self._score_item(store_name, tokens, item, debug) if tokens
+                    else (1.0, {})
+                )
+                if score >= min_confidence:
                     entry = {"source": store_name, "score": round(score, 3)}
+                    if score >= 0.7:
+                        entry["confidence"] = "high"
+                    elif score >= 0.5:
+                        entry["confidence"] = "medium"
+                    else:
+                        entry["confidence"] = "low"
                     entry["content"] = self._format_item(store_name, item)
+                    if debug and debug_info:
+                        entry["_debug"] = debug_info
                     if store_name == "facts":
                         entry["trust_score"] = item.get("trust_score", 0.5)
                         entry["category"] = item.get("category", "general")
@@ -952,6 +1407,9 @@ class SnowSearchEngine:
                         entry["session_id"] = item.get("session_id", "")
                         entry["title"] = item.get("title", "Untitled")
                         entry["last_active"] = item.get("last_active", "")
+                        sid = item.get("session_id", "")
+                        if sid and sid in self._session_raw_fragments:
+                            entry["raw_fragments"] = self._session_raw_fragments[sid]
                     elif store_name == "deep_messages":
                         entry["session_id"] = item.get("session_id", "")
                         entry["timestamp"] = item.get("timestamp", 0)
@@ -962,40 +1420,89 @@ class SnowSearchEngine:
                         entry["tags"] = item.get("tags", [])
                     elif store_name == "soul":
                         entry["source"] = item.get("source", "")
-                    scored.append(entry)
+                    chunk_scored.append(entry)
+            return chunk_scored
+
+        def _search():
+            # Split large datasets into parallel chunks
+            n = len(data)
+            if n <= 1000 or store_name in ("facts", "skills", "soul", "memory"):
+                # Small or already-cheap stores: single-thread
+                return _search_chunk(data)
+
+            chunk_size = max(1000, n // 8)
+            chunks = [data[i:i + chunk_size] for i in range(0, n, chunk_size)]
+            scored = []
+            with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as ex:
+                for chunk_results in ex.map(_search_chunk, chunks):
+                    scored.extend(chunk_results)
 
             scored.sort(key=lambda x: -x["score"])
             return scored[:limit]
         return _search
 
-    @staticmethod
-    def _score_item(store: str, tokens: set[str], item: dict) -> float:
-        """Compute relevance score for one item."""
+    def _score_item(self, store: str, tokens: set[str], item: dict, debug: bool = False) -> tuple[float, dict]:
+        """Compute relevance score for one item.
+
+        Returns (score, debug_info). debug_info is non-empty only when debug=True.
+        """
+        debug_info = {"store": store} if debug else {}
+
         if store == "sessions":
             title = item.get("title", "")
             preview = item.get("preview", "")
-            score = _match_score(tokens, title) * 3.0
-            score += _match_score(tokens, preview) * 1.5
-            return score
+            raw_frags = item.get("raw_fragments", [])
+            # Score title highest, then raw fragments (for short sessions), then preview
+            score_title, di_title = _match_score(tokens, title, debug)
+            score_prev, di_prev = _match_score(tokens, preview, debug)
+            score = score_title * 3.0 + score_prev * 1.5
+            # Also score raw fragments if present (short session supplement)
+            score_frags = 0.0
+            di_frags = []
+            for frag in raw_frags:
+                sf, df = _match_score(tokens, frag, debug)
+                score_frags += sf
+                di_frags.extend(df)
+            if raw_frags:
+                score += (score_frags / len(raw_frags)) * 1.0
+            if debug:
+                debug_info["title_score"] = round(score_title, 3)
+                debug_info["preview_score"] = round(score_prev, 3)
+                debug_info["title_hits"] = di_title
+                debug_info["preview_hits"] = di_prev
+                debug_info["fragments_score"] = round(score_frags / len(raw_frags), 3) if raw_frags else 0
+            return score, debug_info
 
         elif store == "facts":
             content = item.get("content", "")
             tags = item.get("tags", "")
-            score = _match_score(tokens, content) * 2.0
-            score += _match_score(tokens, tags) * 3.0
+            score_con, di_con = _match_score(tokens, content, debug)
+            score_tag, di_tag = _match_score(tokens, tags, debug)
+            score = score_con * 2.0 + score_tag * 3.0
             trust = item.get("trust_score", 0.5)
             score *= trust
-            return score
+            if debug:
+                debug_info["content_score"] = round(score_con, 3)
+                debug_info["tags_score"] = round(score_tag, 3)
+                debug_info["trust"] = trust
+                debug_info["content_hits"] = di_con
+                debug_info["tags_hits"] = di_tag
+            return score, debug_info
 
         elif store == "memory":
             content = item.get("content", "")
-            return _match_score(tokens, content) * 2.0
+            score, di = _match_score(tokens, content, debug)
+            if debug:
+                debug_info["content_score"] = round(score / 2.0, 3)
+                debug_info["content_hits"] = di
+            return score, debug_info
 
         elif store == "deep_messages":
             content = item.get("content", "")
             preview = item.get("content_preview", "")
-            score = _match_score(tokens, content) * 2.0
-            score += _match_score(tokens, preview) * 1.0
+            score_con, di_con = _match_score(tokens, content, debug)
+            score_prev, di_prev = _match_score(tokens, preview, debug)
+            score = score_con * 2.0 + score_prev * 1.0
             # Recency boost: messages within last 24h get +0.5
             import time as _time
             age = _time.time() - item.get("timestamp", 0)
@@ -1003,26 +1510,46 @@ class SnowSearchEngine:
                 score += 0.5
             elif age < 604800:
                 score += 0.2
-            return score
+            if debug:
+                debug_info["content_score"] = round(score_con, 3)
+                debug_info["preview_score"] = round(score_prev, 3)
+                debug_info["recency_boost"] = 0.5 if age < 86400 else (0.2 if age < 604800 else 0)
+                debug_info["content_hits"] = di_con
+                debug_info["preview_hits"] = di_prev
+            return score, debug_info
 
         elif store == "skills":
             name = item.get("name", "")
             desc = item.get("description", "")
             tags = " ".join(item.get("tags", []))
-            score = _match_score(tokens, name) * 4.0
-            score += _match_score(tokens, desc) * 2.0
-            score += _match_score(tokens, tags) * 3.0
-            return score
+            score_name, di_name = _match_score(tokens, name, debug)
+            score_desc, di_desc = _match_score(tokens, desc, debug)
+            score_tags, di_tags = _match_score(tokens, tags, debug)
+            score = score_name * 4.0 + score_desc * 2.0 + score_tags * 3.0
+            if debug:
+                debug_info["name_score"] = round(score_name, 3)
+                debug_info["desc_score"] = round(score_desc, 3)
+                debug_info["tags_score"] = round(score_tags, 3)
+                debug_info["name_hits"] = di_name
+                debug_info["desc_hits"] = di_desc
+                debug_info["tags_hits"] = di_tags
+            return score, debug_info
 
         elif store == "soul":
             content = item.get("content", "")
-            return _match_score(tokens, content) * 1.5
+            score, di = _match_score(tokens, content, debug)
+            if debug:
+                debug_info["content_score"] = round(score / 1.5, 3)
+                debug_info["content_hits"] = di
+            return score, debug_info
 
-        return 0.0
+        return 0.0, {}
 
     @staticmethod
     def _format_item(store: str, item: dict) -> str:
-        """Short display string for one item."""
+        """Display string for one item. Deep messages include surrounding context
+        so agent has full picture without follow-up session_search calls.
+        """
         if store == "sessions":
             return item.get("preview", "") or item.get("title", "")
         elif store == "facts":
@@ -1030,7 +1557,9 @@ class SnowSearchEngine:
         elif store == "memory":
             return item.get("content", "")
         elif store == "deep_messages":
-            return item.get("content_preview", item.get("content", ""))
+            # Return full content + nearby context (truncated to 2000 chars)
+            content = item.get("content", "") or item.get("content_preview", "")
+            return content[:2000]
         elif store == "skills":
             return f"{item.get('name', '')}: {item.get('description', '')}"
         elif store == "soul":
@@ -1240,9 +1769,13 @@ class SnowSearchEngine:
             self._current_bytes = 0
             self._deep_messages = []
             self._deep_bytes = 0
+            self._deep_from_jsonl = False
             self._skills = []
             self._soul = []
             self._holographic_available = None
+            self._session_raw_fragments.clear()
+            self._deep_index.clear()
+            self._deep_index_ready = False
 
         _emit("Reloading snow search index...")
         self._load_all()
