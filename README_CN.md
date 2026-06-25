@@ -4,32 +4,69 @@
 
 > [English](README.md) | 中文版
 
-Hermes Agent 的内存级并行搜索插件。全量加载到 RAM，多路并发，毫秒级返回。默认开启深度搜索，自动搜完整消息正文。支持热重载、状态查看、技能元数据缓存。
+Hermes Agent 的内存级并行搜索插件。轻量源（sessions、facts、memory、skills）驻内存，深度搜索（消息正文）直接查 FTS5 数据库索引——启动秒级、搜索毫秒级、零内存开销。
+
+## 为什么选 snow_search？（对比 session_search）
+
+`session_search` 搜聊天记录。`snow_search` 是 Hermès 的**全局记忆检索层**——让 AI 跨端不失忆、一次召回即答案、人格持续在线。
+
+| 价值 | snow_search | session_search |
+|------|-------------|----------------|
+| **跨端记忆恢复** | 换设备 / 开新会话，AI 接着上次聊，"记得"项目、铁则、偏好——人格连续 | 只搜当前 DB 的消息 |
+| **一次召回完整答案** | 跨源聚合 + 排序 + 置信度。不反复检索、不分页——agent 直接拿到答案 | 返回原始消息；agent 要自己翻、组合、再追搜 |
+| **人格与偏好持久** | 同时搜 memory（USER.md）+ soul + facts——AI 记得你是谁、怎么对你、哪些铁则不能破 | 只搜"说了什么" |
+
+**本质区别**：session_search 找聊天，snow_search 让 AI 真正记得你。
 
 ## 核心优势
 
 | # | 优势 | 说明 |
 |---|------|------|
-| 1 | **<50ms 检索** | 驻内存 + 倒排索引。193K 条消息 → <50ms 每次查询。搜索不走磁盘 |
-| 2 | **5 源并行** | sessions + holographic facts + built-in memory + skill metadata + 全量消息正文，ThreadPoolExecutor 多路并发 |
-| 3 | **深度搜索** | 完整消息正文索引（含 session_id、timestamp、role），覆盖 190K+ 条消息（~34 天） |
-| 4 | **自动清理上下文** | post_llm_call 钩子清空搜索结果。实测 107 条/34K 字符 → 下一轮只剩 ~7K 固定负载 |
-| 5 | **跨会话** | 不限于当前对话，一次搜索覆盖所有历史 session |
-| 6 | **热重载** | snow reload 从磁盘重建 RAM 索引，无需重启 Hermes |
-| 7 | **零 I/O 查看** | snow status 秒出完整索引快照 |
-| 8 | **增量更新** | fact_store/memory 写入即时追加缓存，无需完整重载 |
-| 9 | **自动淘汰** | 超 80% 内存上限时自动清除最旧/低信任条目 |
-| 10 | **全覆盖保证** | full_coverage=true 时深度搜索覆盖每条已存消息 |
+| 1 | **跨端记忆恢复** | 换设备、清上下文——AI"接着上次"。不是"重新认识"，是人格连续 |
+| 2 | **一次召回完整答案** | 5 源并行，排序 + 置信度标注。省 token、省往返、早给回应 |
+| 3 | **人格与偏好持久** | memory + soul + facts 统一搜索。AI 记得你是谁、怎么对你 |
+| 4 | **<3s 启动** | 一次 SQL 探针；深度搜索复用 FTS5 索引 |
+| 5 | **~MB 内存** | 仅轻量源驻内存，消息正文留数据库 |
+| 6 | **精确 total** | FTS5 COUNT(*) —— agent 能准确回答"出现了几次" |
+| 7 | **自动增量更新** | fact_store/memory 写入即时追加；FTS5 触发器保持消息索引实时 |
+| 8 | **上下文不爆炸** | post_llm_call 自动清理搜索结果，对话始终流畅 |
+
+## 示例
+
+直接用自然语言问 AI，snow_search 自动检索——不必记参数，像问人一样问：
+
+**时间回忆**
+- "回忆一下昨天的聊天主题"
+- "回一下最近半个月我在做什么"
+- "上周三我们聊的那个 bug，后来怎么解决的"
+- "这个项目最早是什么时候开始的"
+
+**跨端记忆恢复**
+- "我换了个设备，上次我们聊到哪了？"
+- "之前那个讨论进行到哪一步了，接着说"
+
+**跨源召回（答案不只在聊天里）**
+- "cdog 的配置文件放哪了？" → 命中 facts / memory
+- "我有哪些铁则？" → 命中 memory / soul
+- "snow-agent 项目现在什么进度？" → 命中 facts
+- "怎么用 cdog skill？" → 命中 skills
+
+**精确计数（"几次/多少"类问题）**
+- "「502 报错」这几天出现过几次？"
+- "这个月我提了几次要重构 snow-search？"
+
+**角色过滤（"我说过 / 你说过"）**
+- "我之前有没有说过要重构 snow-agent？" → 只搜 user 消息
+- "你上次怎么教我用 cdog 的？" → 只搜 assistant 消息
 
 ## 工作原理
 
-1. **启动加载** — 后台线程自动加载 sessions、facts、memory、skills 元数据
-2. **全程驻内存** — 数据在 Python 列表中，搜索不走磁盘
-3. **并行搜索** — ThreadPoolExecutor 多路并发
-4. **增量更新** — post_tool_call 钩子捕获写入，追加缓存
-5. **自动淘汰** — 超 80% 内存上限时淘汰最旧条目
-6. **深度搜索** — 完整消息正文索引，一条批量 SQL 加载全部消息。CJK-only 2-gram 分词 + 交集过滤实现快速检索
-7. **技能缓存** — `~/.hermes/skills/*/SKILL.md` frontmatter 启动时预加载
+1. **启动加载（轻量）** — 后台线程加载 sessions、facts、memory、skills 元数据
+2. **驻内存（仅轻量源）** — sessions、facts、memory、skills 在 Python 列表中
+3. **FTS5 深度搜索** — 消息正文留在 SQLite；搜索时查 `messages_fts`（unicode61）和 `messages_fts_trigram`（CJK）
+4. **并行搜索** — ThreadPoolExecutor 并发轻量源；深度搜索内联跑 FTS5 查询
+5. **增量更新** — post_tool_call 钩子捕获 fact_store / memory 写入，追加缓存
+6. **CJK 路由** — ≥3 CJK 字符 → trigram 表；英文/混合 → unicode61；短 CJK（1-2 字）→ LIKE 兜底
 
 ## 安装
 
@@ -44,80 +81,63 @@ hermes plugins enable hermes-snow-search
 ```yaml
 plugins:
   hermes-snow-search:
-    memory_limit_mb: 500          # 安全上限，非实际开销
+    memory_limit_mb: 500          # 轻量源上限（sessions/facts/memory/skills）
     session_max: 7000
     fact_max: 10000
-    deep_search_enabled: true     # 设为 false 仅用轻量模式
-    deep_search_load_mode: "ondemand"   # "ondemand" | "startup"
+    deep_search_enabled: true     # 设为 false 关闭深度搜索
 ```
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `memory_limit_mb` | 500 | 内存硬上限，达 80% 触发淘汰 |
+| `memory_limit_mb` | 500 | 轻量源上限。深度搜索走 FTS5（数据库侧），不计入此上限 |
 | `session_max` | 7000 | 轻量缓存最大 session 数 |
 | `fact_max` | 10000 | 最大事实条目数 |
-| `deep_search_enabled` | true | 开启完整消息正文搜索。设为 false 仅用轻量模式 |
-| `deep_search_load_mode` | ondemand | ondemand = 首次搜索时加载，startup = 启动时后台加载 |
+| `deep_search_enabled` | true | 开启完整消息正文搜索（FTS5） |
 
-> 500 MB 是安全上限，不是实际开销。一个月真实对话（~530 session、~193K 条消息）深度搜索约 92 MB。
-
-### 内存建议
-
-- **轻量模式：** 20 MB 足够存放 session 摘要、facts、memory、skills。设置 `deep_search_enabled: false` 即可使用轻量模式。
-- **深度搜索（默认）：** 完整消息正文约 92 MB/月（193K 条/34 天）。500 MB 覆盖约 6 个月。
-- **多 profile：** 运行多个 Hermes profile 时，预算 N × `memory_limit_mb`，因为每个进程持有独立的内存索引。
+> `memory_limit_mb` 仅约束轻量源。深度搜索复用数据库已有的 FTS5 索引——零额外内存。
 
 ## 上下文清理（post_llm_call）
 
-每次 LLM 回复后，`on_post_llm_call` 钩子会清空 snow_search 工具输出，防止搜索结果跨轮积累。一次搜索增加约 9K–18K 字符，但钩子在下一轮用户消息前将其清空。
+每次 LLM 回复后，`post_llm_call` 钩子会清空 snow_search 工具输出，防止搜索结果跨轮积累——一次搜索增加约 9K–18K 字符，但钩子在下一轮用户消息前将其清空。
 
-**实测验证：** 两次深度搜索（107 条命中，合计约 34K 字符）注入上下文。LLM 回复后，`post_llm_call` 清理所有搜索输出——下一轮只保留固定约 7K 字符的 memory + user profile。
-
-```python
-# 钩子逻辑
-for msg in history:
-    if msg.get("role") == "tool" and msg.get("name") == "snow_search":
-        msg["content"] = ""  # 从上下文清除
-```
-
-> **注意：** 此钩子只清理 snow_search 的工具输出，不影响其他工具结果，也不影响 RAM 中的搜索索引本身。搜索索引在下次调用时仍然可用。
+> **注意：** 只清理 snow_search 的工具输出，不影响其他工具结果，也不影响搜索索引本身（下次调用仍可用）。
 
 ## 深度搜索
 
-默认开启。激活后自动搜索完整消息正文替代轻量摘要。结果含 `session_id`、`timestamp`、`role`、`search_info`。
+默认开启。直接查询数据库已有的 FTS5 索引——无需加载、无内存开销。结果含 `session_id`、`timestamp`、`role`、`snippet`、`search_info`。
 
-### 加载模式
+### FTS5 路由
 
-| 模式 | 触发 | 表现 |
-|------|------|------|
-| `ondemand` | 首次搜索 | 阻塞加载，显示进度 |
-| `startup` | 后台 2.5 秒 | 不阻塞，打印 ~0/50/100% 进度 |
+| 查询类型 | 表名 | 分词器 |
+|---------|------|--------|
+| 英文 / 混合 | `messages_fts` | unicode61（单词边界） |
+| CJK ≥ 3 字 | `messages_fts_trigram` | trigram（三字滑窗） |
+| CJK 1-2 字 | （LIKE 兜底） | 子串匹配 |
+
+FTS5 表由 `hermes_state` 的触发器自动维护——每条消息增删改都同步更新索引。新消息到达无需 reload。
+
+启动输出：
 
 ```
-  ┊ ❄️ [Hermes Snow Search] Loading deep search index: 532 sessions (532 total)...
-  ┊ ❄️ [Hermes Snow Search]   SQL: 193,139 messages fetched
-  ┊ ❄️ [Hermes Snow Search] Deep search ready | 193,139 messages | 34 days (May 13 ~ Jun 16) | 92 MB | 10.0s
-  ┊ ❄️ [Hermes Snow Search] All chat data loaded -- full coverage, no eviction
+  ┊ ❄️ [Hermes Snow Search] Deep search ready (FTS5) | 222500 messages | 44 days (May 13 ~ Jun 26) | ~147 MB indexed on disk | 2.4s
 ```
-
-一条批量 SQL 加载全部消息。倒排索引在加载时一次性构建。搜索时零 I/O。
 
 ### 排序模式
 
 | `sort` | 效果 |
 |--------|------|
-| `relevance` | 最佳匹配优先（相关度 + 近期加分） |
+| `relevance`（默认） | FTS5 rank（BM25）优先，来源优先级作 tiebreaker |
 | `oldest` | 最早时间优先 — 回答"第一次" |
 | `newest` | 最晚时间优先 — 回答"最近一次" |
 
 ### 性能
 
-| 模式 | 搜索范围 | 延迟 | 内存（34 天） |
-|------|----------|------|--------------|
+| 模式 | 搜索范围 | 延迟 | 内存 |
+|------|----------|------|------|
 | 轻量 | Session 摘要 | <1ms | ~3 MB |
-| 深度 | 完整消息正文 | <50ms | ~92 MB（193K 条） |
+| 深度（FTS5） | 完整消息正文 | 0.1–0.2s | ~0（数据库侧索引） |
 
-加载时间：~5s（SQL）+ ~5s（建索引）/193K 条消息。轻量与深度互斥——深度模式跳过 session 摘要，仅加载 facts + memory + messages。
+启动：<3s（一次探针）。不建索引、不加载消息。此前是 ~125s（全量加载 + 内存倒排索引构建）+ ~147 MB 内存。
 
 ## 操作模式
 
@@ -139,9 +159,9 @@ for msg in history:
 {
   "success": true,
   "action": "status",
-  "counts": {"sessions": 263, "facts": 310, "memory": 64, "deep_messages": 12000, "skills": 105},
-  "memory": {"current_mb": 0.2, "deep_mb": 7.5},
-  "coverage": {"full_coverage": true, "date_range": "May 13 ~ May 22"},
+  "counts": {"sessions": 263, "facts": 310, "memory": 64, "deep_messages": 222500, "skills": 105},
+  "memory": {"current_mb": 0.2, "deep_mb": 0},
+  "coverage": {"full_coverage": true, "date_range": "May 13 ~ Jun 26", "fts_mode": true},
   "ready": true,
   "deep_ready": true
 }
@@ -155,22 +175,22 @@ for msg in history:
 
 ## 全覆盖标记
 
-查看 `search_info.full_coverage`——若为 `true`，snow_search 全覆盖。若为 `false`，`session_search` 可能仍需用于较早的 session。
+查看 `search_info.full_coverage`——若为 `true`，snow_search 全覆盖。FTS5 模式下该值恒为 `true`（数据库索引覆盖所有消息）。
 
 ## 注意事项
 
-- **加载时间：** 从 state.db 加载并索引 ~193K 条消息约需 10 秒。加载后搜索 <50ms。
-- **仅根会话：** 只索引顶层对话，子 agent 排除。
+- **启动：** <3s 探针 DB 统计。搜索 0.1–0.2s（FTS5）。
+- **仅根会话：** 深度搜索过滤 `parent_session_id IS NULL`，子 agent session 排除。
 - **不索引工具输出：** 仅 user/assistant 角色消息。
-- **部分覆盖：** 当 `full_coverage` 为 false 时，结合 `session_search` 获取完整结果。
+- **FTS5 依赖：** 深度搜索需要 SQLite FTS5 + trigram tokenizer（Python 3.11+ 自带）。不可用时回退到内存索引。
 
 ## 使用建议
 
-- "最近/上次"类问题天然命中第一条
+- "最近/上次"类问题天然命中第一条（newest 排序 + FTS5 rank）
 - "第一次"类问题用 sort="oldest"
 - 关键词越具体越好
-- 跨进程自动同步，无需手动 reload
-- 搜索覆盖全部内存数据，没找到就是没记录
+- 跨进程自动同步——FTS5 触发器保持索引实时，无需手动 reload
+- 搜索覆盖全部数据，没找到就是没记录
 
 ## 作者
 

@@ -7,32 +7,69 @@
 
 In-memory parallel search plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
 Loads session history, holographic facts (fact_store), built-in memory (MEMORY.md / USER.md), and skill metadata (SKILL.md) into RAM.
-Searches all stores in parallel — results in <1ms. Supports full message-body deep search, hot-reload, and status inspection.
+Deep search (message bodies) queries the existing FTS5 database index — near-instant startup, millisecond search, no memory overhead.
+
+## Why snow_search? (vs session_search)
+
+`session_search` searches chat history. `snow_search` is Hermes' **global memory retrieval layer** — making the AI remember you across devices, return complete answers in one shot, and keep its personality persistent.
+
+| Value | snow_search | session_search |
+|-------|-------------|----------------|
+| **Cross-device memory** | Switch devices / start a new session — the AI still "remembers", picks up where you left off | Only the current DB's messages |
+| **One-shot recall** | Cross-source aggregation + ranking + confidence. No repeated queries, no paging — the agent gets the answer directly | Returns raw messages; agent must re-query, combine, judge relevance itself |
+| **Persistent personality** | Searches memory (USER.md) + soul + facts — the AI remembers *who you are*, your preferences, your hard rules | Only searches *what was said* |
+
+**The core difference:** session_search finds chat; snow_search makes the AI genuinely remember you.
 
 ## Key Advantages
 
 | # | Advantage | Detail |
 |---|-----------|--------|
-| 1 | **<50ms search** | RAM-resident with inverted index. 193K messages → <50ms per query. No disk I/O on search |
-| 2 | **5 sources in parallel** | Sessions + holographic facts + built-in memory + skill metadata + full message bodies. Searched concurrently via `ThreadPoolExecutor` |
-| 3 | **Deep search** | Full message-body index with session_id, timestamp, role. Covers 190K+ messages across 500+ sessions (~34 days) |
-| 4 | **Auto-cleanup** | `post_llm_call` hook clears tool output from context. 107 hits / ~34K chars → clean slate (~7K fixed overhead) before next turn |
-| 5 | **Cross-session** | Not limited to current conversation. Searches every past session in one go |
-| 6 | **Hot reload** | `snow reload` rebuilds the RAM index from disk. No Hermes restart needed |
-| 7 | **Zero-I/O status** | `snow status` returns full index snapshot without touching disk |
-| 8 | **Incremental updates** | Writes to fact_store / memory are appended to cache instantly — no full reload |
-| 9 | **Auto-eviction** | When >80% of memory limit, oldest/lowest-trust entries are evicted automatically |
-|10 | **Full coverage guarantee** | When `full_coverage` is `true`, deep search covers every stored message — no fallback needed |
+| 1 | **Cross-device memory** | Switch devices, clear context — the AI "picks up where you left off". Not a reintroduction, persistent personality |
+| 2 | **One-shot recall** | 5 sources in parallel, ranked + confidence-labeled. Saves tokens, saves round-trips, answers sooner |
+| 3 | **Persistent personality** | Unified search over memory + soul + facts. The AI remembers who you are and how to treat you |
+| 4 | **<3s startup** | One SQL probe; deep search reuses the FTS5 index |
+| 5 | **~MB memory** | Only lightweight stores in RAM; message bodies stay in the DB |
+| 6 | **Precise total** | FTS5 COUNT(*) — agents can answer "how many times" accurately |
+| 7 | **Auto incremental updates** | fact_store/memory writes append instantly; FTS5 triggers keep the message index live |
+| 8 | **Context-safe** | post_llm_call auto-clears search output — conversation stays smooth |
+
+## Examples
+
+Ask the AI in plain language — snow_search triggers automatically. No parameters to remember, just ask like you'd ask a person:
+
+**Time recall**
+- "Remind me what we talked about yesterday"
+- "What have I been working on for the past two weeks?"
+- "That bug we discussed last Wednesday — how did we end up fixing it?"
+- "When did this project actually start?"
+
+**Cross-device memory**
+- "I switched devices — where did we leave off last time?"
+- "Pick up where we got to in that discussion"
+
+**Cross-source recall (answers aren't only in chat)**
+- "Where's the cdog config file?" → hits facts / memory
+- "What hard rules did I set?" → hits memory / soul
+- "What's the current progress on snow-agent?" → hits facts
+- "How do I use the cdog skill?" → hits skills
+
+**Precise counts ("how many times")**
+- "How many times did the 502 error come up this week?"
+- "How often did I bring up refactoring snow-search this month?"
+
+**Role filtering ("did I say / did you say")**
+- "Did I ever mention refactoring snow-agent?" → user messages only
+- "How did you teach me to use cdog last time?" → assistant messages only
 
 ## How it works
 
-1. **Eager load** — sessions, facts, memory entries, and skill metadata are loaded in a background thread right after Hermes starts
-2. **Keep in RAM** — sessions, facts, memory, and skills live in Python lists, no I/O on search
-3. **Parallel search** — `ThreadPoolExecutor` runs all stores concurrently
-4. **Incremental updates** — `post_tool_call` hook catches `fact_store add` and `memory add` → appends to cache
-5. **Eviction** — `pre_llm_call` hook checks memory usage; evicts oldest/lowest-trust entries when >80% of limit
-6. **Deep search** — full message-body index with session_id + timestamp + role. One bulk SQL query loads all messages. CJK-only 2-gram tokenizer + intersection filtering for fast search
-7. **Skills cache** — `~/.hermes/skills/*/SKILL.md` frontmatter (name, description, tags) pre-loaded on startup
+1. **Eager load (lightweight)** — session summaries, facts, memory entries, skill metadata loaded in background thread
+2. **Keep in RAM (lightweight only)** — sessions, facts, memory, skills live in Python lists
+3. **FTS5 for deep search** — message bodies stay in SQLite; `messages_fts` (unicode61) and `messages_fts_trigram` (CJK) are queried at search time
+4. **Parallel search** — `ThreadPoolExecutor` runs lightweight stores concurrently; deep search runs FTS5 query inline
+5. **Incremental updates** — `post_tool_call` hook catches `fact_store add` and `memory add` → appends to cache
+6. **CJK routing** — ≥3 CJK chars → trigram table; English/mixed → unicode61; short CJK (1-2 chars) → LIKE fallback
 
 ## Installation
 
@@ -47,82 +84,63 @@ hermes plugins enable hermes-snow-search
 ```yaml
 plugins:
   hermes-snow-search:
-    memory_limit_mb: 500          # safety cap, not actual usage
+    memory_limit_mb: 500          # cap for lightweight stores (sessions/facts/memory/skills)
     session_max: 7000
     fact_max: 10000
-    deep_search_enabled: true     # set false to use lightweight only
-    deep_search_load_mode: "ondemand"   # "ondemand" | "startup"
+    deep_search_enabled: true     # set false to disable deep search
 ```
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `memory_limit_mb` | 500 | Hard memory cap; eviction triggers at 80% |
+| `memory_limit_mb` | 500 | Cap for lightweight stores. Deep search uses FTS5 (DB-side) and doesn't count against this |
 | `session_max` | 7000 | Max session entries in lightweight cache |
 | `fact_max` | 10000 | Max fact entries in cache |
-| `deep_search_enabled` | true | Enables full message-body search. Set `false` for lightweight-only mode |
-| `deep_search_load_mode` | ondemand | `ondemand` = load on first search, `startup` = background at boot |
+| `deep_search_enabled` | true | Enables full message-body search via FTS5 |
 
-> `memory_limit_mb` (500 MB) is a safety cap, not actual usage. One month of real conversation (~530 sessions, ~193K messages) fits in ~92 MB of deep search data.
-
-### Memory Recommendations
-
-- **Lightweight mode:** 20 MB is sufficient for session summaries, facts, memory, and skills. Set `deep_search_enabled: false` to stay in lightweight mode.
-- **Deep search (default):** Full message bodies consume ~92 MB/month (193K messages over 34 days). 500 MB covers ~6 months.
-- **Multiple profiles:** When running multiple Hermes profiles, budget N × `memory_limit_mb` since each process has its own in-memory index.
+> `memory_limit_mb` applies to lightweight stores only. Deep search queries the existing FTS5 index in the database — zero additional RAM.
 
 ## Context Cleanup (post_llm_call)
 
-After every LLM response, `on_post_llm_call` hook clears snow_search tool output from conversation history. This prevents search results from accumulating across turns — one search round adds ~9K–18K chars to context, but the hook nullifies it before the next user message.
+After every LLM response, the `post_llm_call` hook clears snow_search tool output from conversation history. This prevents search results from accumulating across turns — one search round adds ~9K–18K chars to context, but the hook nullifies it before the next user message.
 
-**Empirical verification:** Two sequential deep searches (107 hits, ~34K chars total) were injected into context. After the LLM replied, `post_llm_call` cleared all search output — next turn carried only the fixed ~7K chars of memory + user profile.
-
-```python
-# Hook logic
-for msg in history:
-    if msg.get("role") == "tool" and msg.get("name") == "snow_search":
-        msg["content"] = ""  # clear from context
-```
-
-> **Note:** The hook clears snow_search tool output only. It does not touch other tool results or the search index itself (which stays in RAM for the next call).
+> **Note:** Only snow_search tool output is cleared — other tool results and the search index itself stay intact.
 
 ## Deep Search
 
-Enabled by default (`deep_search_enabled: true`). When active, full message-body search replaces lightweight session summaries automatically. Results include `session_id`, `timestamp`, `role`, and `search_info`.
+Enabled by default (`deep_search_enabled: true`). Queries the existing FTS5 index in the database for full message-body search — no load step, no memory overhead. Results include `session_id`, `timestamp`, `role`, `snippet`, and `search_info`.
 
-### Load modes
+### FTS5 routing
 
-| Mode | When | Behavior |
-|------|------|----------|
-| `ondemand` (default) | On first deep search | Blocks until index is built, shows progress |
-| `startup` | Background, 2.5s after startup | Non-blocking, prints progress at ~0/50/100% |
+| Query | Table | Tokenizer |
+|-------|-------|-----------|
+| English / mixed | `messages_fts` | unicode61 (word-boundary) |
+| CJK ≥ 3 chars | `messages_fts_trigram` | trigram (3-char sliding window) |
+| CJK 1-2 chars | (LIKE fallback) | substring match |
 
-Progress is written to stderr:
+The FTS5 tables are maintained automatically by triggers in `hermes_state` — every message insert/update/delete updates the index. No reload needed when new messages arrive.
+
+Startup output:
 
 ```
-  ┊ ❄️ [Hermes Snow Search] Loading deep search index: 532 sessions (532 total)...
-  ┊ ❄️ [Hermes Snow Search]   SQL: 193,139 messages fetched
-  ┊ ❄️ [Hermes Snow Search] Deep search ready | 193,139 messages | 34 days (May 13 ~ Jun 16) | 92 MB | 10.0s
-  ┊ ❄️ [Hermes Snow Search] All chat data loaded -- full coverage, no eviction
+  ┊ ❄️ [Hermes Snow Search] Deep search ready (FTS5) | 222500 messages | 44 days (May 13 ~ Jun 26) | ~147 MB indexed on disk | 2.4s
 ```
-
-One bulk SQL query loads all messages. Inverted index built once at load time. No per-search I/O.
 
 ### Sort modes
 
 | `sort` | Behavior |
 |--------|----------|
-| `relevance` (default) | Best match first (recency + keyword score) |
+| `relevance` (default) | FTS5 rank (BM25) first, then source priority as tiebreaker |
 | `oldest` | Earliest timestamp first — answer "when did X first happen" |
 | `newest` | Latest timestamp first — answer "when was the last X" |
 
 ### Performance
 
-| Mode | Searches | Latency | Memory (34 days) |
-|------|----------|---------|------------------|
+| Mode | Searches | Latency | Memory |
+|------|----------|---------|--------|
 | Lightweight | Session summaries | <1ms | ~3 MB |
-| Deep | Full message bodies | <50ms | ~92 MB (193K msg) |
+| Deep (FTS5) | Full message bodies | 0.1–0.2s | ~0 (DB-side index) |
 
-Load time: ~5s (SQL) + ~5s (index build) for 193K messages. Lightweight and deep mode never load simultaneously — deep mode skips sessions and loads facts + memory + messages.
+Startup: <3s (one stats probe). No index build, no message load. Previously this was ~125s (full load + in-memory index build) and ~147 MB RAM.
 
 ## Action Modes
 
@@ -144,9 +162,9 @@ The `action` parameter controls what `snow_search` does:
 {
   "success": true,
   "action": "status",
-  "counts": {"sessions": 263, "facts": 310, "memory": 64, "deep_messages": 12000, "skills": 105},
-  "memory": {"current_mb": 0.2, "deep_mb": 7.5},
-  "coverage": {"full_coverage": true, "date_range": "May 13 ~ May 22"},
+  "counts": {"sessions": 263, "facts": 310, "memory": 64, "deep_messages": 222500, "skills": 105},
+  "memory": {"current_mb": 0.2, "deep_mb": 0},
+  "coverage": {"full_coverage": true, "date_range": "May 13 ~ Jun 26", "fts_mode": true},
   "ready": true,
   "deep_ready": true
 }
@@ -160,22 +178,22 @@ Use `snow_search` to discover available skills. Never read SKILL.md files or Her
 
 ## Full Coverage
 
-Check `search_info.full_coverage` — if `true`, snow_search covers everything. If `false`, `session_search` may be needed for older sessions.
+Check `search_info.full_coverage` — if `true`, snow_search covers everything. If `false`, `session_search` may be needed for older sessions. In FTS5 mode, `full_coverage` is always `true` (the DB index covers all messages).
 
 ## Caveats
 
-- **Load time:** ~10s to load and index ~193K messages from state.db. Searches are <50ms after load.
-- **Root sessions only:** Deep search indexes user ↔ assistant conversations. Subagent sessions (delegate_task children) are excluded.
+- **Startup:** <3s to probe DB stats. Searches are 0.1–0.2s via FTS5.
+- **Root sessions only:** Deep search filters `parent_session_id IS NULL`. Subagent sessions (delegate_task children) are excluded.
 - **Tool messages excluded:** Only `user` and `assistant` role messages are stored.
-- **Partial coverage:** When `full_coverage` is false, combine with `session_search` for complete results.
+- **FTS5 required:** Deep search requires SQLite FTS5 + trigram tokenizer (standard in Python 3.11+). Falls back to in-memory index if unavailable.
 
 ## Usage Tips
 
-- **"Latest" questions match naturally** — snow_search ranks by relevance with recency boost.
+- **"Latest" questions match naturally** — newest-first sort with recency in FTS5 rank.
 - **"First time" questions use `sort="oldest"`** — the earliest hit moves to the top.
 - **Specific keywords win** — "database migration schema users" beats "that database thing".
-- **Cross-process auto-sync** — no manual reload needed between CLI and Gateway.
-- **Trust the result** — snow_search sweeps everything in RAM. If it found nothing, there's no record.
+- **Cross-process auto-sync** — FTS5 triggers keep the index current; no manual reload needed.
+- **Trust the result** — snow_search sweeps everything. If it found nothing, there's no record.
 
 ## Author
 
