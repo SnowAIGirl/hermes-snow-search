@@ -31,6 +31,7 @@ import re
 import sys
 import threading
 import time
+import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -46,7 +47,13 @@ _DEFAULT_MEMORY_MAX = 100
 
 # Deep search
 _DEFAULT_DEEP_ENABLED = True
-_DEFAULT_DEEP_LOAD_MODE = "ondemand"  # "startup" | "ondemand"
+
+# Source priority — primary sort key across all sort modes.
+# Intent: soul/memory (persistent identity + user facts) outrank holographic
+# facts, which outrank raw DB history (deep_messages/sessions). Same store's
+# hits still rank by score/time within their tier, so low-relevance soul hits
+# are filtered out by min_confidence rather than reordered here.
+_SOURCE_PRIORITY = {"soul": 5, "memory": 4, "facts": 3, "deep_messages": 2, "sessions": 1}
 
 # ---------------------------------------------------------------------------
 # Tool schema
@@ -55,15 +62,36 @@ _DEFAULT_DEEP_LOAD_MODE = "ondemand"  # "startup" | "ondemand"
 SNOW_SEARCH_SCHEMA = {
     "name": "snow_search",
     "description": (
-        "Fast in-memory search across ALL stores: session history, holographic facts, "
-        "built-in memory, and skill metadata. Cached in RAM — results in <1ms. Use this "
-        "FIRST for any recall: past conversations, preferences, decisions, project context."
+        "Search across ALL memory stores: session history, message bodies, "
+        "holographic facts, built-in memory, and skill metadata. Deep search "
+        "runs on the DB FTS5 index (~0.1s); lightweight stores are cached in RAM. "
+        "Use this FIRST for any recall: past conversations, preferences, decisions, project context."
+        "\n\n"
+        "When the user mentions past conversations or memory, call snow_search — "
+        "the context window does NOT persist across sessions, so anything not in "
+        "the current window must come from here. Trigger keywords: 回忆, 上次, 最近, "
+        "之前, 那时, 昨天, 上周, 什么时候, recall, last time, recently, earlier. "
+        "Examples: \"回忆一下昨天的聊天\", \"上次那个 bug 怎么解决的\", \"what did we discuss last week\"."
         "\n\n"
         "snow_search is the CANONICAL memory recall tool. ALWAYS searches full "
         "message bodies (deep mode is on by default — no need to pass deep=true). "
         "Hits include full message context (up to 2000 chars) and a confidence "
         "label — high/medium/low based on score. Hits with confidence=high are "
         "trustworthy; trust them and answer directly without follow-up searches."
+        "\n\n"
+        "Result fields:"
+        "\n- total: EXACT full match count across all stores (every item whose "
+        "score > 0), computed independently of the confidence filter and result "
+        "limit. Use total to answer 'how many times', 'how many messages', or "
+        "frequency questions — it is precise, like session_search's COUNT. "
+        "Never count hits[] length — it is capped and confidence-filtered."
+        "\n- hits: the top matches (capped, confidence >= 0.5). Read total for "
+        "counts, hits for content."
+        "\n\n"
+        "Role filter:"
+        "\n- role_filter='user': only messages the USER sent. Use when user asks 'what did I say' or 'did I mention'."
+        "\n- role_filter='assistant': only messages the ASSISTANT/agent said. Use when user asks 'what did you say' or 'did you tell me'."
+        "\n- Omit role_filter to search both sides."
         "\n\n"
         "IMPORTANT — store roles:"
         "\n- snow_search: the ONLY tool for READING/searching memory. Always use this first."
@@ -74,14 +102,18 @@ SNOW_SEARCH_SCHEMA = {
         "\n\n"
         "Action modes:"
         "\n- action=search (default): run a query across all stores"
-        "\n- action=reload: clear and reload the entire search index"
+        "\n- action=reload: clear and reload the entire search index."
         "\n- action=status: get current index statistics (zero I/O)"
         "\n\n"
-        "Guidance: When user says \"snow reload\" or asks to reload/refresh the index, "
-        "pass action=reload. When user says \"snow status\" or asks for index stats, "
-        "pass action=status. Queries about reloading/status of other things "
-        "(e.g. \"how to reload nginx\") are normal searches — only route when "
-        "intent is clearly about the search index itself."
+        "IMPORTANT — reload is RARELY needed. Memory and fact writes are picked up "
+        "INSTANTLY via hooks (no reload required). Only use reload when the user "
+        "EXPLICITLY says 'snow reload' or 'rebuild the search index'. Do NOT call "
+        "reload after memory/fact writes — the index auto-updates."
+        "\n\n"
+        "Guidance: When user explicitly says \"snow reload\", pass action=reload. "
+        "When user says \"snow status\", pass action=status. Queries about reloading "
+        "other things (e.g. \"how to reload nginx\") are normal searches — only route "
+        "when intent is clearly about the search index itself."
         "\n\n"
         "Sort (default=newest):"
         "\n- newest (default): latest timestamp first. Best for 'recent / last time / yesterday / just now' questions."
@@ -111,8 +143,8 @@ SNOW_SEARCH_SCHEMA = {
             },
             "limit_per_source": {
                 "type": "integer",
-                "description": "Max results per source (default: 5, max: 20).",
-                "default": 5,
+                "description": "Max results per source (default: 10, max: 50).",
+                "default": 10,
             },
             "include_sessions": {
                 "type": "boolean",
@@ -157,6 +189,11 @@ SNOW_SEARCH_SCHEMA = {
                 "enum": ["relevance", "oldest", "newest"],
                 "description": "Sort order. Default 'newest' (latest first — best for most recall questions). Use 'oldest' when user asks about first/earliest/original occurrence. Use 'relevance' for pure keyword scoring without time bias.",
                 "default": "newest",
+            },
+            "role_filter": {
+                "type": "string",
+                "enum": ["user", "assistant", "tool"],
+                "description": "Filter deep messages by role. 'user' = only user messages. 'assistant' = only assistant/agent replies. 'tool' = only tool outputs. Omit or pass null to search all roles.",
             },
             "debug": {
                 "type": "boolean",
@@ -323,7 +360,7 @@ class SnowSearchEngine:
 
         # --- deep search config ---
         self._deep_enabled = config.get("deep_search_enabled", _DEFAULT_DEEP_ENABLED)
-        self._deep_mode = config.get("deep_search_load_mode", _DEFAULT_DEEP_LOAD_MODE)
+        # deep_search_load_mode is deprecated — FTS5 mode has no load step
 
         # --- data (lazy loaded) ---
         self._ready = False
@@ -348,8 +385,12 @@ class SnowSearchEngine:
         self._deep_max_message_id = 0  # highest message id loaded
         self._deep_from_jsonl: bool = False  # True when deep data loaded from JSONL (skip SQL refresh)
         self._full_coverage: bool = False  # True when all sessions loaded into deep index
+        self._deep_total_messages: int = 0  # total messages covered (FTS probe or loaded count)
 
-        # --- inverted index for fast deep search ---
+        # --- FTS5 mode (default for deep search; falls back to memory) ---
+        self._use_fts: bool = False  # True when deep search runs via DB FTS5
+
+        # --- inverted index for fast deep search (memory fallback only) ---
         self._deep_index: dict[str, list[int]] = {}
         self._deep_index_ready: bool = False
 
@@ -466,10 +507,293 @@ class SnowSearchEngine:
                 raise
 
     def _load_deep(self) -> None:
-        """Load full message bodies from SessionDB into RAM via bulk query.
+        """Prepare deep search.
 
-        Fetches all user+assistant messages for all root sessions in ONE
-        SQL query, then builds the inverted index with a thread pool.
+        Default path: probe the DB for stats (count, time range) and switch deep
+        search to query the existing FTS5 index at search time — no message
+        bodies are loaded into RAM, no in-memory inverted index is built. This
+        makes startup near-instant and memory tiny.
+
+        Falls back to ``_load_deep_memory`` (full load + inverted index) only if
+        the FTS5 tables are unavailable.
+        """
+        start_time = time.time()
+        self._deep_messages = []
+        self._deep_bytes = 0
+        self._deep_earliest_ts = float("inf")
+        self._deep_latest_ts = 0.0
+        self._deep_total_sessions = 0
+        self._use_fts = False
+
+        # Probe FTS5 availability + stats in one read-only connection.
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB(read_only=True)
+        except Exception as e:
+            logger.debug("snow-search FTS probe failed: %s", e)
+            self._load_deep_memory()
+            return
+
+        try:
+            fts_ok = self._probe_fts_available(db._conn)
+            if not fts_ok:
+                db.close()
+                self._load_deep_memory()
+                return
+
+            stats = db._conn.execute(
+                "SELECT COUNT(*), "
+                "COALESCE(MIN(m.timestamp), 0), "
+                "COALESCE(MAX(m.timestamp), 0), "
+                "COALESCE(SUM(LENGTH(m.content)), 0) "
+                "FROM messages m "
+                "JOIN sessions s ON s.id = m.session_id "
+                "WHERE s.parent_session_id IS NULL "
+                "AND m.role IN ('user','assistant') "
+                "AND m.content IS NOT NULL AND m.content != ''"
+            ).fetchone()
+            count, earliest, latest, total_chars = stats
+            self._deep_total_messages = count or 0
+            self._deep_earliest_ts = float(earliest) if earliest else 0.0
+            self._deep_latest_ts = float(latest) if latest else 0.0
+            self._deep_total_sessions = db._conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE parent_session_id IS NULL"
+            ).fetchone()[0]
+            self._deep_bytes = (total_chars or 0) * 3 + (count or 0) * 100  # est, for status report only
+
+            self._use_fts = True
+            self._full_coverage = True  # FTS sees the whole DB; cap doesn't apply
+            elapsed = time.time() - start_time
+            mb = self._deep_bytes // (1024 * 1024)
+            cov = ""
+            if self._deep_earliest_ts < float("inf") and self._deep_latest_ts > 0:
+                days = (self._deep_latest_ts - self._deep_earliest_ts) / 86400
+                e = datetime.datetime.fromtimestamp(self._deep_earliest_ts).strftime("%b %d")
+                l = datetime.datetime.fromtimestamp(self._deep_latest_ts).strftime("%b %d")
+                cov = f" | {days:.0f} days ({e} ~ {l})" if days >= 1 else ""
+            _emit(f"Deep search ready (FTS5) | {count} messages{cov} | ~{mb} MB indexed on disk | {elapsed:.1f}s")
+        except Exception as e:
+            logger.debug("snow-search FTS stats probe failed: %s", e)
+            db.close()
+            self._load_deep_memory()
+            return
+        else:
+            db.close()
+
+    @staticmethod
+    def _probe_fts_available(conn) -> bool:
+        """Return True if the FTS5 trigram table exists and is queryable."""
+        try:
+            conn.execute(
+                "SELECT 1 FROM messages_fts_trigram LIMIT 1"
+            ).fetchone()
+            return True
+        except Exception:
+            return False
+
+    # -- FTS5 deep search -----------------------------------------------------
+
+    @staticmethod
+    def _count_cjk(text: str) -> int:
+        """Count individual CJK characters in text (not CJK runs)."""
+        if not text:
+            return 0
+        return sum(len(run) for run in _CJK_RE.findall(text))
+
+    @staticmethod
+    def _has_short_cjk_token(text: str) -> bool:
+        """True if any whitespace-separated CJK token has < 3 CJK chars.
+
+        Trigram needs ≥3 CJK chars per token; a query like "广西 OR 桂林" has
+        ≥3 total but each token is only 2 — trigram returns nothing.
+        """
+        if not text:
+            return False
+        for tok in text.split():
+            cjk = "".join(_CJK_RE.findall(tok))
+            if cjk and len(cjk) < 3:
+                return True
+        return False
+
+    def _build_fts_query(self, query: str, table: str) -> str:
+        """Build a safe FTS5 MATCH expression.
+
+        For trigram (CJK) we quote each non-operator token. For unicode61 we
+        pass the query through more permissively (hermes_state sanitizes, but we
+        keep it simple and robust here).
+        """
+        if table == "messages_fts_trigram":
+            parts = []
+            for tok in query.split():
+                if tok.upper() in {"AND", "OR", "NOT"}:
+                    parts.append(tok)
+                else:
+                    parts.append('"' + tok.replace('"', '""') + '"')
+            return " ".join(parts)
+        # unicode61: quote phrases to avoid FTS5 syntax errors on punctuation
+        return '"' + query.replace('"', '""') + '"'
+
+    def _search_deep_fts(
+        self,
+        query: str,
+        tokens: set,
+        role_filter: str | None,
+        start_ts,
+        end_ts,
+        sort: str,
+        limit: int,
+    ) -> tuple[list, int]:
+        """Search deep_messages via the DB FTS5 index.
+
+        Returns (hits, exact_total). No message bodies are held in RAM between
+        searches — only the returned hits.
+        """
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB(read_only=True)
+        except Exception as e:
+            logger.debug("snow-search FTS open failed: %s", e)
+            return [], 0
+
+        try:
+            is_cjk = bool(_CJK_RE.search(query))
+            cjk_count = self._count_cjk(query)
+            if is_cjk and cjk_count >= 3 and not self._has_short_cjk_token(query):
+                table = "messages_fts_trigram"
+            elif is_cjk and cjk_count > 0 and cjk_count < 3:
+                # short CJK: LIKE fallback (trigram can't match <3 CJK chars)
+                return self._search_deep_like(db, query, role_filter, start_ts, end_ts, sort, limit)
+            else:
+                table = "messages_fts"
+
+            fts_query = self._build_fts_query(query, table)
+
+            where = [f"{table} MATCH ?"]
+            params: list = [fts_query]
+            where.append("s.parent_session_id IS NULL")
+            where.append("m.role IN ('user','assistant')")
+            if role_filter:
+                where.append("m.role = ?")
+                params.append(role_filter)
+            if start_ts is not None:
+                where.append("m.timestamp >= ?")
+                params.append(start_ts)
+            if end_ts is not None:
+                where.append("m.timestamp < ?")
+                params.append(end_ts)
+            where_sql = " AND ".join(where)
+
+            if sort == "oldest":
+                order = "m.timestamp ASC, rank"
+            elif sort == "newest":
+                order = "m.timestamp DESC, rank"
+            else:
+                order = "rank"
+
+            # Exact total (independent of limit)
+            count_sql = (
+                f"SELECT COUNT(*) FROM {table} "
+                f"JOIN messages m ON m.id = {table}.rowid "
+                f"JOIN sessions s ON s.id = m.session_id "
+                f"WHERE {where_sql}"
+            )
+            try:
+                exact_total = db._conn.execute(count_sql, params).fetchone()[0]
+            except Exception:
+                exact_total = 0
+
+            search_limit = max(limit, limit * 3)
+            sel_sql = (
+                f"SELECT m.id, m.session_id, m.role, m.content, m.timestamp, "
+                f"snippet({table}, 0, '>>>', '<<<', '...', 40) AS snippet "
+                f"FROM {table} "
+                f"JOIN messages m ON m.id = {table}.rowid "
+                f"JOIN sessions s ON s.id = m.session_id "
+                f"WHERE {where_sql} "
+                f"ORDER BY {order} "
+                f"LIMIT ?"
+            )
+            rows = db._conn.execute(sel_sql, params + [search_limit]).fetchall()
+
+            hits = []
+            n = len(rows)
+            for i, r in enumerate(rows):
+                # Linear score normalization: first hit 1.0, last ≥ 0.5
+                score = round(1.0 - (0.5 * i / n) if n > 0 else 1.0, 3)
+                entry = {
+                    "source": "deep_messages",
+                    "score": score,
+                    "confidence": "high" if score >= 0.7 else ("medium" if score >= 0.5 else "low"),
+                    "content": r[3][:2000],
+                    "session_id": r[1],
+                    "timestamp": r[4],
+                    "role": r[2],
+                    "snippet": r[5] or "",
+                }
+                hits.append(entry)
+            return hits, exact_total
+        except Exception as e:
+            logger.debug("snow-search FTS query failed: %s", e)
+            return [], 0
+        finally:
+            db.close()
+
+    def _search_deep_like(
+        self, db, query: str, role_filter, start_ts, end_ts, sort: str, limit: int
+    ) -> tuple[list, int]:
+        """LIKE fallback for short CJK queries (1-2 chars) where trigram fails."""
+        where = ["m.content LIKE ?"]
+        esc = "%" + query.replace("%", "\\%").replace("_", "\\_") + "%"
+        params: list = [esc]
+        where.append("s.parent_session_id IS NULL")
+        where.append("m.role IN ('user','assistant')")
+        if role_filter:
+            where.append("m.role = ?")
+            params.append(role_filter)
+        if start_ts is not None:
+            where.append("m.timestamp >= ?")
+            params.append(start_ts)
+        if end_ts is not None:
+            where.append("m.timestamp < ?")
+            params.append(end_ts)
+        where_sql = " AND ".join(where)
+
+        order = "m.timestamp ASC" if sort == "oldest" else "m.timestamp DESC"
+        try:
+            exact_total = db._conn.execute(
+                f"SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id = m.session_id WHERE {where_sql}",
+                params,
+            ).fetchone()[0]
+            rows = db._conn.execute(
+                f"SELECT m.id, m.session_id, m.role, m.content, m.timestamp "
+                f"FROM messages m JOIN sessions s ON s.id = m.session_id "
+                f"WHERE {where_sql} ORDER BY {order} LIMIT ?",
+                params + [max(limit, limit * 3)],
+            ).fetchall()
+        except Exception as e:
+            logger.debug("snow-search LIKE fallback failed: %s", e)
+            return [], 0
+
+        hits = []
+        n = len(rows)
+        for i, r in enumerate(rows):
+            score = round(1.0 - (0.5 * i / n) if n > 0 else 1.0, 3)
+            hits.append({
+                "source": "deep_messages",
+                "score": score,
+                "confidence": "high" if score >= 0.7 else ("medium" if score >= 0.5 else "low"),
+                "content": r[3][:2000],
+                "session_id": r[1],
+                "timestamp": r[4],
+                "role": r[2],
+            })
+        return hits, exact_total
+
+    def _load_deep_memory(self) -> None:
+        """Load full message bodies from SessionDB into RAM via streamed queries.
+
+        Memory-fallback path used when FTS5 is unavailable. Keyset-paginates
+        newest-then-oldest segments so memory stays bounded by memory_limit_mb.
         """
         import concurrent.futures
 
@@ -508,60 +832,165 @@ class SnowSearchEngine:
         self._deep_earliest_ts = float("inf")
         self._deep_latest_ts = 0.0
 
-        # 3. Bulk query — fetch all messages in one shot
+        # Memory cap (85% of limit, matching JSONL path)
+        cap = int(self._memory_limit * 0.85)
+        newest_budget = int(cap * 0.8)
+        oldest_budget = cap - newest_budget
+
+        # 3. Open read-only connection and load with keyset pagination
         try:
             from hermes_state import SessionDB
             db2 = SessionDB(read_only=True)
         except Exception:
             db2 = None
 
-        all_rows = []
-        if db2:
-            try:
-                # Chunk IN clauses to avoid SQLite variable limit
-                CHUNK = 500
-                for i in range(0, len(session_ids), CHUNK):
-                    chunk = session_ids[i:i + CHUNK]
-                    placeholders = ",".join("?" * len(chunk))
-                    rows = db2._conn.execute(
-                        f"SELECT id, session_id, role, content, timestamp "
-                        f"FROM messages WHERE session_id IN ({placeholders}) "
-                        f"AND role IN ('user','assistant') AND content IS NOT NULL "
-                        f"AND content != '' "
-                        f"ORDER BY id",
-                        chunk,
-                    ).fetchall()
-                    all_rows.extend(rows)
-                _emit(f"  SQL: {len(all_rows)} messages fetched")
-            finally:
-                db2.close()
-
-        if not all_rows:
+        if not db2:
             self._load_deep_jsonl()
             return
 
-        # 4. Build entries in one pass
-        for row in all_rows:
-            entry = {
-                "message_id": row[0],
-                "session_id": row[1],
-                "role": row[2],
-                "content": row[3],
-                "timestamp": row[4],
-                "content_preview": row[3][:200],
-            }
-            self._deep_messages.append(entry)
-            self._deep_bytes += len(row[3]) * 3 + 100  # CJK: ~3 bytes/char, fast estimate
-            ts = row[4]
-            if ts < self._deep_earliest_ts:
-                self._deep_earliest_ts = ts
-            if ts > self._deep_latest_ts:
-                self._deep_latest_ts = ts
+        # Build a TEMP table of session_ids so we can avoid giant IN clauses.
+        # SQLite allows TEMP tables on read-only connections (they live in :memory:).
+        try:
+            db2._conn.execute("CREATE TEMP TABLE _snow_sids(id TEXT PRIMARY KEY)")
+            CHUNK = 500
+            for i in range(0, len(session_ids), CHUNK):
+                chunk = session_ids[i:i + CHUNK]
+                placeholders = ",".join(f"('{sid}')" for sid in chunk)
+                db2._conn.execute(f"INSERT INTO _snow_sids VALUES {placeholders}")
+        except Exception:
+            # TEMP table creation failed (should not happen on modern SQLite)
+            # Fall back to chunked IN clauses
+            pass
+
+        def _msg_bytes_estimate(content: str) -> int:
+            return len(content) * 3 + 100  # CJK: ~3 bytes/char
+
+        newest_count = 0
+        oldest_count = 0
+        _capped = False
+
+        # Base SELECT + WHERE, reused across all fetches.
+        _BASE = (
+            "SELECT m.id, m.session_id, m.role, m.content, m.timestamp "
+            "FROM messages m JOIN _snow_sids s ON m.session_id = s.id "
+            "WHERE m.role IN ('user','assistant') "
+            "AND m.content IS NOT NULL AND m.content != ''"
+        )
+
+        try:
+            # --- Probe: cheap aggregate to decide capped vs full-load.
+            # COUNT + SUM(LENGTH) scans once but materializes nothing into
+            # Python, so it's fast even on hundreds of thousands of rows.
+            row = db2._conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(m.content)), 0) "
+                "FROM messages m JOIN _snow_sids s ON m.session_id = s.id "
+                "WHERE m.role IN ('user','assistant') "
+                "AND m.content IS NOT NULL AND m.content != ''"
+            ).fetchone()
+            total_count = row[0] or 0
+            total_chars = row[1] or 0
+            est_total_bytes = total_chars * 3 + total_count * 100
+
+            if total_count == 0:
+                db2.close()
+                self._load_deep_jsonl()
+                return
+
+            if est_total_bytes <= cap:
+                # --- Full coverage: ONE bulk fetch, ONE sort. No pagination. ---
+                rows = db2._conn.execute(
+                    _BASE + " ORDER BY m.timestamp DESC, m.id DESC"
+                ).fetchall()
+                for r in rows:
+                    entry = {
+                        "message_id": r[0], "session_id": r[1], "role": r[2],
+                        "content": r[3], "timestamp": r[4],
+                        "content_preview": r[3][:200],
+                    }
+                    self._deep_messages.append(entry)
+                    self._deep_bytes += _msg_bytes_estimate(r[3])
+                newest_count = len(rows)
+                _capped = False
+            else:
+                # --- Capped: two LIMIT queries (newest + oldest), merge, sort, trim. ---
+                avg = est_total_bytes / total_count if total_count else 1
+                # Pull ~2× budget each side, then trim in memory to exact cap.
+                # Over-fetch is fine: we'll drop low-priority rows (mid-history).
+                newest_limit = int((newest_budget / avg) * 1.5) + 500
+                oldest_limit = int((oldest_budget / avg) * 1.5) + 500
+
+                rows_new = db2._conn.execute(
+                    _BASE + " ORDER BY m.timestamp DESC, m.id DESC LIMIT ?",
+                    (newest_limit,),
+                ).fetchall()
+                rows_old = db2._conn.execute(
+                    _BASE + " ORDER BY m.timestamp ASC, m.id ASC LIMIT ?",
+                    (oldest_limit,),
+                ).fetchall()
+
+                # Merge, dedupe, sort by timestamp DESC.
+                seen: set = set()
+                merged = []
+                for r in rows_new:
+                    if r[0] not in seen:
+                        seen.add(r[0]); merged.append(r)
+                for r in rows_old:
+                    if r[0] not in seen:
+                        seen.add(r[0]); merged.append(r)
+                merged.sort(key=lambda r: (-r[4], -r[0]))  # timestamp DESC, id DESC
+
+                # Dual-end trim: head (newest) + tail (oldest), drop the middle.
+                # merged is sorted DESC, so head = newest, tail = oldest.
+                def _sz(r):
+                    return _msg_bytes_estimate(r[3])
+
+                head, head_bytes = [], 0
+                for r in merged:
+                    if head_bytes + _sz(r) > newest_budget and head:
+                        break
+                    head.append(r); head_bytes += _sz(r)
+
+                tail, tail_bytes = [], 0
+                head_ids = {r[0] for r in head}
+                for r in reversed(merged):
+                    if r[0] in head_ids:
+                        break  # reached head's territory — stop, no overlap
+                    if tail_bytes + _sz(r) > oldest_budget and tail:
+                        break
+                    tail.append(r); tail_bytes += _sz(r)
+
+                _capped = bool(head_ids) and (len(head) + len(tail) < len(merged))
+                # Final order: newest-first (head DESC) + oldest (tail was ASC,
+                # reversed back to DESC so the whole list stays DESC).
+                for r in head + list(reversed(tail)):
+                    entry = {
+                        "message_id": r[0], "session_id": r[1], "role": r[2],
+                        "content": r[3], "timestamp": r[4],
+                        "content_preview": r[3][:200],
+                    }
+                    self._deep_messages.append(entry)
+                    self._deep_bytes += _sz(r)
+
+                newest_count = len(head)
+                oldest_count = len(tail)
+
+            _emit(f"  SQL: {newest_count} newest + {oldest_count} oldest messages")
+
+        finally:
+            db2.close()
+
+        if not self._deep_messages:
+            self._load_deep_jsonl()
+            return
+
+        # Already fetched newest-first (DESC); oldest segment was reversed on
+        # merge. No re-sort needed — order is newest-first as required.
+        # Update time range
+        if self._deep_messages:
+            self._deep_earliest_ts = min(m["timestamp"] for m in self._deep_messages)
+            self._deep_latest_ts = max(m["timestamp"] for m in self._deep_messages)
 
         self._deep_total_sessions = len(set(m["session_id"] for m in self._deep_messages))
-
-        # 5. Sort by timestamp descending
-        self._deep_messages.sort(key=lambda m: -m["timestamp"])
 
         # 6. Track max message id for incremental refresh
         if self._deep_messages:
@@ -574,7 +1003,6 @@ class SnowSearchEngine:
         mb_used = self._deep_bytes // (1024 * 1024)
         elapsed = time.time() - start_time
         if self._deep_earliest_ts < float("inf"):
-            import datetime
             earliest = datetime.datetime.fromtimestamp(self._deep_earliest_ts).strftime("%b %d")
             latest = datetime.datetime.fromtimestamp(self._deep_latest_ts).strftime("%b %d")
             days = (self._deep_latest_ts - self._deep_earliest_ts) / 86400
@@ -585,27 +1013,63 @@ class SnowSearchEngine:
         # 7. Build inverted index
         self._build_deep_index()
 
-        self._full_coverage = True
+        self._full_coverage = not _capped
         _emit(
             f"Deep search ready | {msg_count} messages{coverage} | {mb_used} MB | {elapsed:.1f}s"
         )
-        _emit("All chat data loaded -- full coverage, no eviction")
+        if _capped:
+            _emit("Memory cap applied — newest + oldest retained, mid-history evicted. Raise memory_limit_mb for fuller coverage.")
+        else:
+            _emit("All chat data loaded -- full coverage, no eviction")
 
     def _build_deep_index(self) -> None:
         """Build inverted index: token -> [message_index, ...].
 
         Called lazily on first search, not during load, so reload feels instant.
+        Parallelized via ThreadPoolExecutor for large datasets (>10k messages).
         """
         from collections import defaultdict
+        from concurrent.futures import ThreadPoolExecutor
 
-        index = defaultdict(list)
-        for idx, msg in enumerate(self._deep_messages):
-            content = msg.get("content", "")
-            if not content:
-                continue
-            for tok in _tokenize(content):
-                index[tok].append(idx)
-        self._deep_index = dict(index)
+        n = len(self._deep_messages)
+        if n <= 10000:
+            # Small: single-thread is fine
+            index = defaultdict(list)
+            for idx, msg in enumerate(self._deep_messages):
+                content = msg.get("content", "")
+                if not content:
+                    continue
+                for tok in _tokenize(content):
+                    index[tok].append(idx)
+            self._deep_index = dict(index)
+        else:
+            # Large: parallel chunking (each chunk returns partial dict)
+            chunk_size = max(5000, n // 8)
+            chunks = [(i, self._deep_messages[i:i + chunk_size])
+                      for i in range(0, n, chunk_size)]
+
+            def _index_chunk(start_idx, msgs):
+                local = defaultdict(list)
+                for off, msg in enumerate(msgs):
+                    idx = start_idx + off
+                    content = msg.get("content", "")
+                    if not content:
+                        continue
+                    for tok in _tokenize(content):
+                        local[tok].append(idx)
+                return dict(local)
+
+            index = defaultdict(list)
+            ex = ThreadPoolExecutor(max_workers=min(8, len(chunks)))
+            try:
+                for partial in ex.map(_index_chunk, [c[0] for c in chunks], [c[1] for c in chunks]):
+                    for tok, ids in partial.items():
+                        index[tok].extend(ids)
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
+
+            self._deep_index = dict(index)
+
         self._deep_index_ready = True
 
     def _load_deep_jsonl(self) -> None:
@@ -742,7 +1206,6 @@ class SnowSearchEngine:
         msg_count = len(self._deep_messages)
         mb_used = self._deep_bytes // (1024 * 1024)
         if self._deep_earliest_ts < float("inf"):
-            import datetime
             earliest = datetime.datetime.fromtimestamp(self._deep_earliest_ts).strftime("%b %d")
             latest = datetime.datetime.fromtimestamp(self._deep_latest_ts).strftime("%b %d")
             days = (self._deep_latest_ts - self._deep_earliest_ts) / 86400
@@ -1080,13 +1543,14 @@ class SnowSearchEngine:
     ) -> str:
         """Tool handler: parallel search across all loaded stores."""
         query = args.get("query", "")
-        limit = min(int(args.get("limit_per_source", 5)), 20)
+        limit = min(int(args.get("limit_per_source", 10)), 50)
         include_sessions = args.get("include_sessions", True)
         include_facts = args.get("include_facts", True)
         include_memory = args.get("include_memory", True)
         include_skills = args.get("include_skills", True)
         include_soul = args.get("include_soul", True)
         deep = args.get("deep", True)
+        role_filter = args.get("role_filter")
         debug = args.get("debug", False)
 
         start_ts = args.get("start_timestamp")
@@ -1136,7 +1600,13 @@ class SnowSearchEngine:
                 if include_sessions and self._sessions:
                     stores["sessions"] = self._sessions
             else:
-                if include_sessions and self._deep_messages:
+                if self._use_fts:
+                    # FTS mode: deep_messages are queried from the DB at search
+                    # time, not held in RAM. Register a sentinel so the store is
+                    # included; the searcher routes to _search_deep_fts.
+                    if include_sessions:
+                        stores["deep_messages"] = []  # sentinel; FTS ignores it
+                elif include_sessions and self._deep_messages:
                     data = self._deep_messages
                     if has_time_filter:
                         data = [m for m in data
@@ -1175,42 +1645,93 @@ class SnowSearchEngine:
         else:
             searcher_limit = limit * 10 if sort in ("oldest", "newest") else limit
 
+        # Source priority: soul > memory > facts > deep_messages > sessions
+        # (see _SOURCE_PRIORITY). Primary key in every sort mode.
+
         hits = []
-        with ThreadPoolExecutor(max_workers=len(stores)) as ex:
-            future_map = {}
-            for store_name, data in stores.items():
-                fn = self._make_searcher(store_name, data, query_tokens, searcher_limit, debug=debug, min_confidence=MIN_CONFIDENCE)
+        exact_total = 0
+        # NOTE: do NOT use `with ThreadPoolExecutor(...)` — its __exit__ calls
+        # shutdown(wait=True), which blocks until every worker finishes and
+        # ignores KeyboardInterrupt. That made Ctrl-C unable to interrupt a
+        # running search. Manage the executor manually so we can bail out fast
+        # on interrupt: cancel pending futures and skip waiting on in-flight ones.
+        # deep_messages in FTS mode is queried directly from the DB — no
+        # in-memory dataset, so it can't go through the chunk searcher. Run it
+        # inline, then run the remaining (in-memory) stores in parallel.
+        fts_stores = []
+        mem_stores = {}
+        for store_name, data in stores.items():
+            if store_name == "deep_messages" and self._use_fts:
+                fts_stores.append(store_name)
+            else:
+                mem_stores[store_name] = data
+
+        if fts_stores and query_tokens:
+            try:
+                fts_hits, fts_exact = self._search_deep_fts(
+                    query=query,
+                    tokens=query_tokens,
+                    role_filter=role_filter,
+                    start_ts=start_ts if has_time_filter else None,
+                    end_ts=end_ts if has_time_filter else None,
+                    sort=sort,
+                    limit=limit,
+                )
+                hits.extend(fts_hits)
+                exact_total += fts_exact
+            except Exception as e:
+                logger.debug("snow-search deep FTS failed: %s", e)
+
+        ex = ThreadPoolExecutor(max_workers=max(1, len(mem_stores)))
+        future_map = {}
+        try:
+            for store_name, data in mem_stores.items():
+                fn = self._make_searcher(store_name, data, query_tokens, searcher_limit, debug=debug, min_confidence=MIN_CONFIDENCE, role_filter=role_filter)
                 future_map[ex.submit(fn)] = store_name
             for f in as_completed(future_map):
                 store_name = future_map[f]
                 try:
-                    hits.extend(f.result())
+                    scored, exact = f.result()
+                    hits.extend(scored)
+                    exact_total += exact
                 except Exception as e:
                     logger.debug("snow-search %s failed: %s", store_name, e)
+        except BaseException:
+            for f in future_map:
+                f.cancel()
+            raise
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
 
-        
+        # Sorting — snow_search replaces session_search, so deep_messages is
+        # the main stage: rank by true relevance/time first. _SOURCE_PRIORITY
+        # is a TIEBREAKER only (same score/timestamp), never the primary key —
+        # otherwise soul/memory bury real chat matches ("soul 霸榜").
         if sort == "oldest":
-            hits.sort(key=lambda h: h.get("timestamp", float("inf")) if h.get("timestamp") else float("inf"))
-            total = len(hits)
-            hits = hits[:limit * 3]
+            hits.sort(key=lambda h: (h.get("timestamp", float("inf")) if h.get("timestamp") else float("inf"),
+                                     -_SOURCE_PRIORITY.get(h.get("source", ""), 0)))
         elif sort == "newest":
-            hits.sort(key=lambda h: -(h.get("timestamp", 0) if h.get("timestamp") else 0))
-            total = len(hits)
-            hits = hits[:limit * 3]
+            hits.sort(key=lambda h: (-(h.get("timestamp", 0) if h.get("timestamp") else 0),
+                                     -_SOURCE_PRIORITY.get(h.get("source", ""), 0)))
         else:
-            hits.sort(key=lambda h: (-h.get("score", 0), h.get("source", "")))
-            total = len(hits)
-            hits = hits[:limit * 3]
+            # relevance: pure score, no source bias
+            hits.sort(key=lambda h: -h.get("score", 0))
+        # total = full match count (any score > 0) across all stores, NOT
+        # capped by min_confidence or limit. This mirrors session_search's
+        # precise COUNT semantics — agents can trust it for frequency questions.
+        total = exact_total
+        hits = hits[:limit * 3]
 
         search_info = {
-            "sessions_scanned": len(self._sessions) if not deep and self._sessions else self._deep_total_sessions if deep and self._deep_messages else 0,
+            "sessions_scanned": self._deep_total_sessions if deep and self._deep_enabled else len(self._sessions),
             "full_coverage": getattr(self, "_full_coverage", False),
         }
-        if deep and self._deep_messages:
-            search_info["messages_scanned"] = len(self._deep_messages)
+        if deep and self._deep_enabled:
+            search_info["messages_scanned"] = getattr(self, "_deep_total_messages", len(self._deep_messages))
             if self._deep_earliest_ts < float("inf") and self._deep_latest_ts > 0:
-                import datetime
                 search_info["date_range"] = f"{datetime.datetime.fromtimestamp(self._deep_earliest_ts).strftime('%b %d')} ~ {datetime.datetime.fromtimestamp(self._deep_latest_ts).strftime('%b %d')}"
+            if self._use_fts:
+                search_info["fts_mode"] = True
         if debug:
             search_info["debug"] = True
             search_info["tokens"] = list(query_tokens)
@@ -1237,7 +1758,7 @@ class SnowSearchEngine:
 
         return json.dumps(result, ensure_ascii=False)
 
-    def _make_searcher(self, store_name: str, data: list[dict], tokens: set[str], limit: int, debug: bool = False, min_confidence: float = 0.5):
+    def _make_searcher(self, store_name: str, data: list[dict], tokens: set[str], limit: int, debug: bool = False, min_confidence: float = 0.5, role_filter: str | None = None):
         """Return a callable that searches one store.
 
         When tokens is empty (time-filter-only mode), every item gets score=1.0.
@@ -1265,13 +1786,22 @@ class SnowSearchEngine:
                     data = [self._deep_messages[i] for i in candidates
                             if i < len(self._deep_messages)]
 
+        # role_filter applies to deep_messages regardless of which path produced
+        # `data` above (inverted-index prefilter, time-only mode, or index-not-ready
+        # fallback). Filtering here guarantees it is never silently dropped.
+        if store_name == "deep_messages" and role_filter and data:
+            data = [m for m in data if m.get("role") == role_filter]
+
         def _search_chunk(chunk):
             chunk_scored = []
+            chunk_exact = 0  # full match count (any score > 0), NOT capped by min_confidence
             for item in chunk:
                 score, debug_info = (
                     self._score_item(store_name, tokens, item, debug) if tokens
                     else (1.0, {})
                 )
+                if score > 0:
+                    chunk_exact += 1
                 if score >= min_confidence:
                     entry = {"source": store_name, "score": round(score, 3)}
                     if score >= 0.7:
@@ -1304,24 +1834,37 @@ class SnowSearchEngine:
                     elif store_name == "soul":
                         entry["source"] = item.get("source", "")
                     chunk_scored.append(entry)
-            return chunk_scored
+            return chunk_scored, chunk_exact
 
         def _search():
-            # Split large datasets into parallel chunks
+            # Only deep_messages benefits from chunked parallelism — it is the
+            # one store large enough (tens of thousands of messages) to justify
+            # the inner thread pool. Every other store is small enough that the
+            # pool overhead + GIL contention outweighs any gain, so score them
+            # single-threaded.
             n = len(data)
-            if n <= 1000 or store_name in ("facts", "skills", "soul", "memory"):
-                # Small or already-cheap stores: single-thread
+            if store_name != "deep_messages" or n <= 1000:
                 return _search_chunk(data)
 
             chunk_size = max(1000, n // 8)
             chunks = [data[i:i + chunk_size] for i in range(0, n, chunk_size)]
             scored = []
-            with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as ex:
-                for chunk_results in ex.map(_search_chunk, chunks):
-                    scored.extend(chunk_results)
+            exact = 0
+            # Manual executor control (see handle_search): the `with` form's
+            # shutdown(wait=True) would block Ctrl-C. ex.map drains results in
+            # order; on interrupt we cancel pending chunks and stop waiting.
+            ex = ThreadPoolExecutor(max_workers=min(8, len(chunks)))
+            try:
+                for chunk_scored, chunk_exact in ex.map(_search_chunk, chunks):
+                    scored.extend(chunk_scored)
+                    exact += chunk_exact
+            except BaseException:
+                raise
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
 
             scored.sort(key=lambda x: -x["score"])
-            return scored[:limit]
+            return scored[:limit], exact
         return _search
 
     def _score_item(self, store: str, tokens: set[str], item: dict, debug: bool = False) -> tuple[float, dict]:
@@ -1387,8 +1930,7 @@ class SnowSearchEngine:
             score_prev, di_prev = _match_score(tokens, preview, debug)
             score = score_con * 2.0 + score_prev * 1.0
             # Recency boost: messages within last 24h get +0.5
-            import time as _time
-            age = _time.time() - item.get("timestamp", 0)
+            age = time.time() - item.get("timestamp", 0)
             if age < 86400:
                 score += 0.5
             elif age < 604800:
@@ -1682,19 +2224,21 @@ class SnowSearchEngine:
             "sessions": len(self._sessions),
             "facts": len(self._facts),
             "memory": len(self._memory_entries),
-            "deep_messages": len(self._deep_messages),
+            "deep_messages": getattr(self, "_deep_total_messages", len(self._deep_messages)),
             "skills": len(self._skills),
             "soul": len(self._soul),
         }
 
         memory_mb = {
             "current_mb": round(self._current_bytes / (1024 * 1024), 1),
-            "deep_mb": round(self._deep_bytes / (1024 * 1024), 1),
+            "deep_mb": round(self._deep_bytes / (1024 * 1024), 1) if not self._use_fts else 0,
         }
 
         coverage = {
             "full_coverage": getattr(self, "_full_coverage", False),
         }
+        if self._use_fts:
+            coverage["fts_mode"] = True
         if self._deep_earliest_ts < float("inf") and self._deep_latest_ts > 0:
             coverage["date_range"] = (
                 f"{datetime.datetime.fromtimestamp(self._deep_earliest_ts).strftime('%b %d')}"
@@ -1727,7 +2271,7 @@ class SnowSearchEngine:
         if self._deep_enabled:
             try:
                 self._ensure_deep_loaded()
-                msg += f" | deep: {len(self._deep_messages)} messages, ~{self._deep_bytes // (1024 * 1024)} MB"
+                msg += f" | deep: {getattr(self, '_deep_total_messages', len(self._deep_messages))} messages"
             except Exception as e:
                 msg += f" | deep: error ({e})"
         if self._load_error:
