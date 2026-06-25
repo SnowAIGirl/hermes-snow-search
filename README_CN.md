@@ -2,7 +2,7 @@
 
 <p align="center"><img src="assets/avator_default_png8.png" width="500" alt="Snow"></p>
 
-> [English](README.md) | 中文版
+> [English](README.md) | 中文版 | [更新日志](CHANGELOG.md)
 
 Hermes Agent 的内存级并行搜索插件。轻量源（sessions、facts、memory、skills）驻内存，深度搜索（消息正文）直接查 FTS5 数据库索引——启动秒级、搜索毫秒级、零内存开销。
 
