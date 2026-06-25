@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.1] — 2026-06-26
+
+### Added
+- CHANGELOG.md for v0.1.0 through v0.6.0 (Keep a Changelog format).
+- Changelog link (`[Changelog](CHANGELOG.md)`) in both README.md and README_CN.md.
+
+### Fixed
+- README/README_CN.md content restored after rebase (PR #1 merge had them, reset didn't lose them).
+
 ## [0.6.0] — 2026-06-26
 
 ### Added
