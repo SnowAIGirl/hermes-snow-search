@@ -3,7 +3,7 @@
 <p align="center"><img src="https://avatars.githubusercontent.com/u/286937193?v=4" width="500" alt="Snow"></p>
 
 > [![GitHub](https://img.shields.io/badge/GitHub-mlinquan%2Fhermes--snow--search-blue?logo=github)](https://github.com/mlinquan/hermes-snow-search)
-> English | [Chinese](README_CN.md)
+> English | [Chinese](README_CN.md) | [Changelog](CHANGELOG.md)
 
 In-memory parallel search plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
 Loads session history, holographic facts (fact_store), built-in memory (MEMORY.md / USER.md), and skill metadata (SKILL.md) into RAM.
